@@ -44,6 +44,7 @@ pub struct ShadeData {
     pub name: String,   // raw base64, stored as-is
     pub capabilities: ShadeCapabilities,
     pub power_type: PowerType,
+    #[serde(default)]
     pub battery_status: Option<BatteryStatus>, // nullable in v3; None = unavailable
     pub room_id: i32,                          // always present in v3
     pub firmware: ShadeFirmware,               // always present in v3
@@ -163,7 +164,7 @@ pub struct ShadeFirmware {
 
 /// serde_repr does not support `#[serde(other)]`, so we implement manual Deserialize
 /// with an `Unknown(i32)` fallback for forward compatibility.
-#[derive(Serialize, Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub enum ShadeCapabilities {
     BottomUp,             // 0
     BottomUpTilt90,       // 1
@@ -198,6 +199,27 @@ impl<'de> Deserialize<'de> for ShadeCapabilities {
             11 => Self::Illuminated,
             other => Self::Unknown(other),
         })
+    }
+}
+
+impl serde::Serialize for ShadeCapabilities {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let v: i32 = match self {
+            Self::BottomUp => 0,
+            Self::BottomUpTilt90 => 1,
+            Self::BottomUpTilt180 => 2,
+            Self::VerticalTilt180 => 3,
+            Self::Vertical => 4,
+            Self::TiltOnly180 => 5,
+            Self::TopDown => 6,
+            Self::TopDownBottomUp => 7,
+            Self::DualOverlapped => 8,
+            Self::DualOverlappedTilt90 => 9,
+            Self::DuoliteTilt180 => 10,
+            Self::Illuminated => 11,
+            Self::Unknown(n) => *n,
+        };
+        v.serialize(s)
     }
 }
 
