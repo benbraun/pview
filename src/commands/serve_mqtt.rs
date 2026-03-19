@@ -194,7 +194,7 @@ async fn register_diagnostic_entity(
                 )],
                 name: format!("PowerView Hub {serial}"),
                 manufacturer: WEZ.to_string(),
-                model: MODEL.to_string(),
+                model: gateway_data.model.clone(),
                 serial_number: None,
                 sw_version: Some(pview_version().to_string()),
                 suggested_area: None,
@@ -277,6 +277,12 @@ async fn register_shades(
             .flags()
             .contains(ShadeCapabilityFlags::SECONDARY_RAIL);
 
+        let area = room_by_id.get(&shade.room_id).cloned();
+        let device_id = format!("{serial}-{}", shade.id);
+        let shade_display_name = match &area {
+            Some(room) => format!("{room} {}", shade.pt_name),
+            None => shade.pt_name.clone(),
+        };
         // For TDBU shades the primary rail is the bottom and the secondary is the top.
         // Give them explicit names so HA shows "Bottom" and "Top" under one device.
         let primary_name = if has_secondary { Some("Bottom".to_string()) } else { None };
@@ -290,12 +296,6 @@ async fn register_shades(
             ));
         }
 
-        let area = room_by_id.get(&shade.room_id).cloned();
-        let device_id = format!("{serial}-{}", shade.id);
-        let shade_display_name = match &area {
-            Some(room) => format!("{room} {}", shade.pt_name),
-            None => shade.pt_name.clone(),
-        };
         let device = Device {
             suggested_area: area,
             identifiers: vec![device_id.clone()],
@@ -556,6 +556,7 @@ async fn register_scenes(
     let hub = state.hub.load();
     let scenes = hub.hub.list_scenes().await?;
     let serial = &state.serial;
+    let hub_model = hub.gateway_data.model.clone();
 
     for scene in scenes {
         let scene_id = scene.id;
@@ -568,7 +569,7 @@ async fn register_scenes(
                     identifiers: vec![format!("{MODEL}-{serial}")],
                     name: format!("PowerView Hub {serial}"),
                     manufacturer: HUNTER_DOUGLAS.to_string(),
-                    model: MODEL.to_string(),
+                    model: hub_model.clone(),
                     serial_number: None,
                     suggested_area: None,
                     via_device: None,
