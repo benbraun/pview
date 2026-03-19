@@ -46,6 +46,8 @@ pub struct Device {
     pub manufacturer: String,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sw_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggested_area: Option<String>,
