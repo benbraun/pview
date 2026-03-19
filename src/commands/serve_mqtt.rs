@@ -553,42 +553,28 @@ async fn register_scenes(
 ) -> anyhow::Result<()> {
     let hub = state.hub.load();
     let scenes = hub.hub.list_scenes().await?;
-    let room_by_id: HashMap<i32, String> = hub
-        .hub
-        .list_rooms()
-        .await?
-        .into_iter()
-        .map(|room| (room.id, room.pt_name))
-        .collect();
-
     let serial = &state.serial;
 
     for scene in scenes {
         let scene_id = scene.id;
         let scene_name = scene.pt_name.clone();
-        let suggested_area = scene
-            .room_ids
-            .first()
-            .and_then(|id| room_by_id.get(id))
-            .cloned();
-
         let unique_id = format!("{serial}-scene-{scene_id}");
 
         let config = SceneConfig {
             base: EntityConfig {
                 device: Device {
-                    suggested_area,
-                    identifiers: vec![unique_id.clone()],
-                    via_device: Some(format!("{MODEL}-{serial}")),
-                    name: scene_name,
+                    identifiers: vec![format!("{MODEL}-{serial}")],
+                    name: format!("PowerView Hub {serial}"),
                     manufacturer: HUNTER_DOUGLAS.to_string(),
                     model: MODEL.to_string(),
+                    suggested_area: None,
+                    via_device: None,
                     connections: vec![],
                     sw_version: None,
                 },
                 availability_topic: format!("{MODEL}/scene/{serial}/{scene_id}/availability"),
                 device_class: None,
-                name: None,
+                name: Some(scene_name),
                 origin: Origin::default(),
                 unique_id: unique_id.clone(),
                 entity_category: None,
