@@ -503,6 +503,45 @@ async fn register_shades(
                 power_type_to_state(shade.power_type).to_string(),
             );
         }
+
+        {
+            let velocity_pct = state.velocities.lock().unwrap()
+                .get(&shade.id).copied().unwrap_or(0.0) * 100.0;
+            let velocity = NumberConfig {
+                base: EntityConfig {
+                    unique_id: format!("{device_id}-velocity"),
+                    name: Some("Velocity".to_string()),
+                    availability_topic: format!(
+                        "{MODEL}/shade/{serial}/{}/availability",
+                        shade.id
+                    ),
+                    device_class: None,
+                    origin: Origin::default(),
+                    device: device.clone(),
+                    entity_category: None,
+                    icon: Some("mdi:speedometer".to_string()),
+                    enabled_by_default: None,
+                },
+                state_topic: format!("{MODEL}/shade/{serial}/{}/velocity/state", shade.id),
+                command_topic: format!("{MODEL}/shade/{serial}/{}/velocity/set", shade.id),
+                min: 0.0,
+                max: 100.0,
+                step: 1.0,
+                mode: "slider".to_string(),
+            };
+            reg.delete(format!(
+                "{}/number/{device_id}-velocity/config",
+                state.discovery_prefix
+            ));
+            reg.config(
+                format!(
+                    "{}/number/{device_id}-velocity/config",
+                    state.discovery_prefix
+                ),
+                serde_json::to_string(&velocity)?,
+            );
+            reg.update(velocity.state_topic, format!("{velocity_pct:.0}"));
+        }
     }
 
     Ok(())
@@ -769,6 +808,7 @@ impl ServeMqttCommand {
             first_run: AtomicBool::new(true),
             responding: AtomicBool::new(true),
             motion_tasks: std::sync::Mutex::new(HashMap::new()),
+            velocities: std::sync::Mutex::new(HashMap::new()),
         });
 
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
@@ -808,6 +848,12 @@ impl ServeMqttCommand {
                 .route(
                     format!("{MODEL}/shade/:serial/:shade_id/command"),
                     mqtt_shade_command,
+                )
+                .await?;
+            router
+                .route(
+                    format!("{MODEL}/shade/:serial/:shade_id/velocity/set"),
+                    mqtt_shade_set_velocity,
                 )
                 .await?;
             register_with_hass(state).await?;
@@ -1238,10 +1284,11 @@ async fn mqtt_shade_set_position(
     let hub = state.hub.load();
     let shade = hub.hub.shade_by_id(shade_id).await?;
 
+    let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
     let pos = if is_secondary {
-        ShadePosition { secondary: Some(ShadePosition::percent_to_pos(position)), ..Default::default() }
+        ShadePosition { secondary: Some(ShadePosition::percent_to_pos(position)), velocity, ..Default::default() }
     } else {
-        ShadePosition { primary: Some(ShadePosition::percent_to_pos(position)), ..Default::default() }
+        ShadePosition { primary: Some(ShadePosition::percent_to_pos(position)), velocity, ..Default::default() }
     };
 
     log::info!(
@@ -1296,11 +1343,23 @@ async fn mqtt_shade_command(
     match command.as_ref() {
         "OPEN" => {
             advise_hass_of_state_label(&state, &shade_id_str, "opening").await?;
-            hub.hub.move_shade(shade_id, ShadeUpdateMotion::Up).await?;
+            let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
+            hub.hub
+                .set_shade_position(
+                    shade_id,
+                    ShadePosition { primary: Some(1.0), velocity, ..Default::default() },
+                )
+                .await?;
         }
         "CLOSE" => {
             advise_hass_of_state_label(&state, &shade_id_str, "closing").await?;
-            hub.hub.move_shade(shade_id, ShadeUpdateMotion::Down).await?;
+            let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
+            hub.hub
+                .set_shade_position(
+                    shade_id,
+                    ShadePosition { primary: Some(0.0), velocity, ..Default::default() },
+                )
+                .await?;
         }
         "STOP" => {
             hub.hub.move_shade(shade_id, ShadeUpdateMotion::Stop).await?;
@@ -1312,6 +1371,46 @@ async fn mqtt_shade_command(
             log::warn!("Command {command} has no handler");
         }
     }
+    Ok(())
+}
+
+async fn mqtt_shade_set_velocity(
+    params: Params<SerialAndShade>,
+    Topic(topic): Topic,
+    State(state): State<Arc<Pv2MqttState>>,
+    Payload(value): Payload<f64>,
+) -> anyhow::Result<()> {
+    let Params(SerialAndShade {
+        serial,
+        shade_id: ShadeIdAddr { shade_id, .. },
+    }) = params;
+
+    if serial != state.serial {
+        log::warn!(
+            "ignoring {topic} which is intended for \
+                    serial={serial}, while we are serial {actual_serial}",
+            actual_serial = state.serial
+        );
+        return Ok(());
+    }
+
+    let velocity = (value / 100.0).clamp(0.0, 1.0);
+    state.velocities.lock().unwrap().insert(shade_id, velocity);
+
+    state
+        .client
+        .publish(
+            &format!(
+                "{MODEL}/shade/{serial}/{shade_id}/velocity/state",
+                serial = state.serial
+            ),
+            format!("{value:.0}").as_bytes(),
+            QoS::AtMostOnce,
+            false,
+        )
+        .await?;
+
+    log::info!("Set velocity for shade {shade_id} to {value:.0}%");
     Ok(())
 }
 
@@ -1338,6 +1437,8 @@ struct Pv2MqttState {
     first_run: AtomicBool,
     responding: AtomicBool,
     motion_tasks: std::sync::Mutex<HashMap<i32, tokio::task::AbortHandle>>,
+    /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
+    velocities: std::sync::Mutex<HashMap<i32, f64>>,
 }
 
 impl Pv2MqttState {
