@@ -165,7 +165,7 @@ impl Hub {
     /// Sends a motion command to the hub.
     /// Up/Down/LeftTilt/RightTilt map to `PUT home/shades/{id}/positions`.
     /// Jog maps to `PUT home/shades/{id}/motion {"motion":"jog"}`.
-    /// Stop maps to `PUT home/shades/stop {"ids":[id]}`.
+    /// Stop maps to `PUT home/shades/stop?ids={id}` with empty body.
     pub async fn move_shade(
         &self,
         shade_id: i32,
@@ -208,9 +208,9 @@ impl Hub {
                 Ok(())
             }
             ShadeUpdateMotion::Stop => {
-                let url = self.url("home/shades/stop");
+                let url = self.url(&format!("home/shades/stop?ids={shade_id}"));
                 let _: serde_json::Value =
-                    request_with_json_response(Method::PUT, url, &json!({"ids": [shade_id]}))
+                    request_with_json_response(Method::PUT, url, &json!({}))
                         .await?;
                 Ok(())
             }
