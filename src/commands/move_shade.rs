@@ -3,10 +3,14 @@ use crate::api_types::{ShadePosition, ShadeUpdateMotion};
 #[derive(clap::Args, Debug)]
 #[group(required = true)]
 struct TargetPosition {
-    #[arg(long, conflicts_with = "percent")]
+    #[arg(long, conflicts_with = "percent,secondary_percent")]
     motion: Option<ShadeUpdateMotion>,
+    /// Set the primary rail position (0–100)
     #[arg(long, group = "position")]
     percent: Option<u8>,
+    /// Set the secondary (middle) rail position (0–100)
+    #[arg(long, group = "position")]
+    secondary_percent: Option<u8>,
 }
 
 /// Move or set the position of a shade
@@ -34,8 +38,15 @@ impl MoveShadeCommand {
             };
             hub.set_shade_position(shade.id, pos).await?;
             println!("Set {} (id={}) primary to {percent}%", shade.pt_name, shade.id);
+        } else if let Some(percent) = self.target_position.secondary_percent {
+            let pos = ShadePosition {
+                secondary: Some(ShadePosition::percent_to_pos(percent)),
+                ..Default::default()
+            };
+            hub.set_shade_position(shade.id, pos).await?;
+            println!("Set {} (id={}) secondary to {percent}%", shade.pt_name, shade.id);
         } else {
-            anyhow::bail!("One of --motion or --percent is required");
+            anyhow::bail!("One of --motion, --percent, or --secondary-percent is required");
         }
         Ok(())
     }
