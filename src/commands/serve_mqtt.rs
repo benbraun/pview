@@ -992,6 +992,7 @@ impl ServeMqttCommand {
                     (event.current_positions, event.target_positions)
                 {
                     if let Some(eta) = target.eta_in_seconds {
+                        let eta = (eta - 1.0).max(0.5);
                         log::info!("Spawning interpolation for id={} eta={eta:.1}s", event.id);
                         let abort = spawn_position_interpolation(
                             Arc::clone(state),
