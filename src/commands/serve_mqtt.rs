@@ -518,7 +518,7 @@ async fn register_shades(
                     device_class: None,
                     origin: Origin::default(),
                     device: device.clone(),
-                    entity_category: None,
+                    entity_category: Some("config".to_string()),
                     icon: Some("mdi:speedometer".to_string()),
                     enabled_by_default: None,
                 },
