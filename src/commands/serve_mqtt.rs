@@ -524,7 +524,7 @@ async fn register_shades(
                 },
                 state_topic: format!("{MODEL}/shade/{serial}/{}/velocity/state", shade.id),
                 command_topic: format!("{MODEL}/shade/{serial}/{}/velocity/set", shade.id),
-                min: 0.0,
+                min: 7.0,
                 max: 100.0,
                 step: 1.0,
                 mode: "slider".to_string(),
@@ -1394,8 +1394,12 @@ async fn mqtt_shade_set_velocity(
         return Ok(());
     }
 
-    let velocity = (value / 100.0).clamp(0.0, 1.0);
-    state.velocities.lock().unwrap().insert(shade_id, velocity);
+    // Store None for 0 so it's omitted from the positions payload (hub uses default speed).
+    let velocity = if value <= 0.0 { None } else { Some((value / 100.0).min(1.0)) };
+    match velocity {
+        Some(v) => { state.velocities.lock().unwrap().insert(shade_id, v); }
+        None => { state.velocities.lock().unwrap().remove(&shade_id); }
+    }
 
     state
         .client
