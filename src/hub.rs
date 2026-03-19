@@ -186,7 +186,7 @@ impl Hub {
     pub async fn shade_events_stream(
         &self,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShadeEvent>>> {
-        let client = reqwest::Client::builder().timeout(None).build()?;
+        let client = reqwest::Client::builder().build()?;
         let url = format!("http://{}/home/shades/events?sse=true", self.addr);
         let response = client.get(&url).send().await?;
         let byte_stream = response.bytes_stream();
