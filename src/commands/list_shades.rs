@@ -20,52 +20,37 @@ impl ListShadesCommand {
         };
 
         let rooms = hub.list_rooms().await?;
+        let shades = hub.list_shades(opt_room_id).await?;
 
-        let shades = hub.list_shades(None, opt_room_id).await?;
-
-        let mut shades_by_room = BTreeMap::new();
+        let mut shades_by_room: BTreeMap<i32, Vec<_>> = BTreeMap::new();
         for shade in shades {
-            let room = shades_by_room
-                .entry(shade.room_id.unwrap_or(0))
-                .or_insert_with(|| vec![]);
-            room.push(shade);
+            shades_by_room.entry(shade.room_id).or_default().push(shade);
         }
 
         let columns = &[
-            Column {
-                name: "ROOM".to_string(),
-                alignment: Alignment::Left,
-            },
-            Column {
-                name: "SHADE".to_string(),
-                alignment: Alignment::Left,
-            },
-            Column {
-                name: "POSITION".to_string(),
-                alignment: Alignment::Right,
-            },
+            Column { name: "ROOM".to_string(), alignment: Alignment::Left },
+            Column { name: "SHADE".to_string(), alignment: Alignment::Left },
+            Column { name: "POSITION".to_string(), alignment: Alignment::Right },
         ];
         let mut rows = vec![];
         for room_data in &rooms {
             if let Some(shades) = shades_by_room.get(&room_data.id) {
                 for shade in shades {
-                    if let Some(pos) = shade.positions.as_ref() {
+                    rows.push(vec![
+                        room_data.pt_name.clone(),
+                        shade.pt_name.clone(),
+                        shade.positions.describe_pos1(),
+                    ]);
+                    if shade
+                        .capabilities
+                        .flags()
+                        .contains(ShadeCapabilityFlags::SECONDARY_RAIL)
+                    {
                         rows.push(vec![
-                            room_data.name.to_string(),
-                            shade.name().to_string(),
-                            pos.describe_pos1(),
+                            room_data.pt_name.clone(),
+                            format!("{} Middle Rail", shade.pt_name),
+                            shade.positions.describe_pos2(),
                         ]);
-                        if shade
-                            .capabilities
-                            .flags()
-                            .contains(ShadeCapabilityFlags::SECONDARY_RAIL)
-                        {
-                            rows.push(vec![
-                                room_data.name.to_string(),
-                                shade.secondary_name(),
-                                pos.describe_pos2(),
-                            ]);
-                        }
                     }
                 }
             }
