@@ -434,7 +434,7 @@ async fn register_shades(
                         "{MODEL}/sensor/{serial}/{}/signal/availability",
                         shade.id
                     ),
-                    device_class: None,
+                    device_class: Some("signal_strength".to_string()),
                     origin: Origin::default(),
                     device: device.clone(),
                     entity_category: Some("diagnostic".to_string()),
@@ -442,7 +442,7 @@ async fn register_shades(
                     enabled_by_default: Some(false),
                 },
                 state_topic: format!("{MODEL}/sensor/{device_id}-signal/state"),
-                unit_of_measurement: Some("%".to_string()),
+                unit_of_measurement: Some("dBm".to_string()),
             };
             reg.delete(format!(
                 "{}/sensor/{device_id}-signal/config",
@@ -455,9 +455,9 @@ async fn register_shades(
                 ),
                 serde_json::to_string(&signal)?,
             );
-            if let Some(pct) = shade.signal_strength_percent() {
+            if let Some(dbm) = shade.signal_strength {
                 reg.update(signal.base.availability_topic, "online");
-                reg.update(signal.state_topic, format!("{pct}"));
+                reg.update(signal.state_topic, format!("{:.0}", dbm));
             } else {
                 reg.update(signal.base.availability_topic, "offline");
             }
