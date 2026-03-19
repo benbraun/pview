@@ -51,7 +51,7 @@ impl ListShadesCommand {
                         rows.push(vec![
                             room_data.pt_name.clone(),
                             String::new(),
-                            format!("{} Middle Rail", shade.pt_name),
+                            format!("{} Top Rail", shade.pt_name),
                             shade.positions.describe_pos2(),
                         ]);
                     }
