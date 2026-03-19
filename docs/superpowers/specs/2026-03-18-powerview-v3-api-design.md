@@ -443,6 +443,8 @@ Startup sequence:
 - `room_by_id` map value: use `room.pt_name` instead of `room.name`
 - MQTT command handlers `"OPEN"` / `"CLOSE"` / `"STOP"` / `"JOG"`: call `move_shade().await?` and return. Remove the `advise_hass_of_updated_position` call that followed — position state is now updated by the SSE `motion-stopped` event handler instead. This means position feedback is slightly deferred but reflects the hub's confirmed final position.
 - Remove handlers for `"CALIBRATE"`, `"HEART"`, `"UPDATE_BATTERY"`, `"REFRESH_POS"` commands entirely
+- `handle_discovery` change-detection: replace `user_data.ip != hub.user_data.ip || user_data.hub_name != hub.user_data.hub_name` with `config.network_status.ip_address != hub.gateway_data.network_status.ip_address`. Drop the `hub_name` comparison — `GatewayConfig` does not need `PartialEq`.
+- "Power Source" entity: rename topic helper from `battery_kind_state_topic()` to `power_type_state_topic()`, using `pv2mqtt/sensor/{serial}/{shade_id}/psu/state` (change `select/` to `sensor/` in the path to match the new `SensorConfig` registration). The availability topic changes similarly from `.../psu/availability` — keep the same path structure but under `sensor/`.
 
 ### Periodic polling
 
@@ -452,6 +454,7 @@ Startup sequence:
 
 - **Remove:** `axum`, `matchit`, `serde_urlencoded`
 - **Update:** `reqwest` gains `stream` feature: `features = ["json", "stream"]`
+- **Add:** `futures-util = "0.3"` — provides `StreamExt` for working with the `Stream` returned by `shade_events_stream()` and for `bytes_stream()` processing
 
 ---
 
