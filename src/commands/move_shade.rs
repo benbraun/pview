@@ -3,7 +3,7 @@ use crate::api_types::{ShadeCapabilityFlags, ShadePosition, ShadeUpdateMotion};
 #[derive(clap::Args, Debug)]
 #[group(required = true)]
 struct TargetPosition {
-    #[arg(long, conflicts_with = "percent,secondary_percent")]
+    #[arg(long, conflicts_with_all = ["percent", "secondary_percent"])]
     motion: Option<ShadeUpdateMotion>,
     /// Set the primary rail position (0–100)
     #[arg(long, group = "position")]
