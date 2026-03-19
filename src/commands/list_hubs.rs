@@ -14,19 +14,17 @@ impl ListHubsCommand {
             crate::discovery::resolve_hubs(Some(Duration::from_secs(self.timeout))).await?;
 
         while let Some(hub) = hubs.recv().await {
-            if let Some(user_data) = &hub.user_data {
+            if let Some(gateway_data) = &hub.gateway_data {
                 println!(
-                    "{addr} SN={serial} MAC={mac} {name}",
+                    "{addr} SN={serial} MAC={mac}",
                     addr = hub.hub.addr(),
-                    serial = user_data.serial_number,
-                    name = user_data.hub_name.to_string(),
-                    mac = user_data.mac_address
+                    serial = gateway_data.serial_number,
+                    mac = gateway_data.network_status.primary_mac_address,
                 );
             } else {
                 println!("{} (Not responding)", hub.hub.addr());
             }
         }
-
         Ok(())
     }
 }
