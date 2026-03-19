@@ -29,6 +29,7 @@ impl ListShadesCommand {
 
         let columns = &[
             Column { name: "ROOM".to_string(), alignment: Alignment::Left },
+            Column { name: "ID".to_string(), alignment: Alignment::Right },
             Column { name: "SHADE".to_string(), alignment: Alignment::Left },
             Column { name: "POSITION".to_string(), alignment: Alignment::Right },
         ];
@@ -38,6 +39,7 @@ impl ListShadesCommand {
                 for shade in shades {
                     rows.push(vec![
                         room_data.pt_name.clone(),
+                        shade.id.to_string(),
                         shade.pt_name.clone(),
                         shade.positions.describe_pos1(),
                     ]);
@@ -48,6 +50,7 @@ impl ListShadesCommand {
                     {
                         rows.push(vec![
                             room_data.pt_name.clone(),
+                            String::new(),
                             format!("{} Middle Rail", shade.pt_name),
                             shade.positions.describe_pos2(),
                         ]);
