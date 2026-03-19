@@ -106,27 +106,33 @@ impl Hub {
             anyhow::bail!("No shade with id {id} was found");
         }
 
-        // "Room/Shade" qualified lookup
-        if let Some((room_part, shade_part)) = name.split_once('/') {
-            let room_part = room_part.trim();
-            let shade_part = shade_part.trim();
-            let mut matched: Vec<ShadeData> = shades
-                .into_iter()
-                .filter(|s| {
-                    s.pt_name.eq_ignore_ascii_case(shade_part)
+        // Room-qualified lookup: try every space split position to find a
+        // "Room Name Shade Name" combination that matches a real room+shade pair.
+        let words: Vec<&str> = name.split_whitespace().collect();
+        if words.len() > 1 {
+            let mut qualified_matches: Vec<ShadeData> = vec![];
+            for split in 1..words.len() {
+                let room_part = words[..split].join(" ");
+                let shade_part = words[split..].join(" ");
+                for shade in &shades {
+                    if shade.pt_name.eq_ignore_ascii_case(&shade_part)
                         && room_name_by_id
-                            .get(&s.room_id)
-                            .map(|r| r.eq_ignore_ascii_case(room_part))
+                            .get(&shade.room_id)
+                            .map(|r| r.eq_ignore_ascii_case(&room_part))
                             .unwrap_or(false)
-                })
-                .collect();
-            return match matched.len() {
-                1 => Ok(matched.remove(0)),
-                0 => anyhow::bail!("No shade matching '{name}' was found"),
-                _ => anyhow::bail!(
-                    "Multiple shades match '{name}'; use the numeric id instead"
-                ),
-            };
+                    {
+                        qualified_matches.push(shade.clone());
+                    }
+                }
+            }
+            if !qualified_matches.is_empty() {
+                return match qualified_matches.len() {
+                    1 => Ok(qualified_matches.remove(0)),
+                    _ => anyhow::bail!(
+                        "Multiple shades match '{name}'; use the numeric id instead"
+                    ),
+                };
+            }
         }
 
         // Bare name lookup — error if ambiguous
@@ -145,7 +151,7 @@ impl Hub {
                             .get(&s.room_id)
                             .copied()
                             .unwrap_or("unknown");
-                        format!("  {room}/{name}")
+                        format!("  {room} {name}")
                     })
                     .collect();
                 anyhow::bail!(

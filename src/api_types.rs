@@ -34,7 +34,7 @@ pub struct Scene {
 
 // ── Shades ────────────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ShadeData {
     pub id: i32,
