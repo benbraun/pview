@@ -17,6 +17,10 @@ pub struct EntityConfig {
     pub entity_category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// When `Some(false)`, tells HA to disable this entity by default.
+    /// Omitted when `None` (HA defaults to enabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled_by_default: Option<bool>,
 }
 
 #[derive(Serialize, Clone, Debug)]
