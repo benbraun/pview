@@ -1,4 +1,4 @@
-use crate::api_types::UserData;
+use crate::api_types::GatewayConfig;
 use crate::hub::Hub;
 use anyhow::Context;
 use std::net::IpAddr;
@@ -64,7 +64,7 @@ pub async fn resolve_hub(timeout: Duration) -> anyhow::Result<IpAddr> {
 #[derive(Clone, Debug)]
 pub struct ResolvedHub {
     pub hub: Hub,
-    pub user_data: Option<UserData>,
+    pub gateway_data: Option<GatewayConfig>,
 }
 
 impl ResolvedHub {
@@ -74,8 +74,8 @@ impl ResolvedHub {
     }
 
     pub async fn with_hub(hub: Hub) -> Self {
-        let user_data = hub.get_user_data().await.ok();
-        ResolvedHub { hub, user_data }
+        let gateway_data = hub.get_gateway_data().await.ok();
+        ResolvedHub { hub, gateway_data }
     }
 }
 
@@ -92,8 +92,8 @@ pub async fn resolve_hub_with_serial(
 ) -> anyhow::Result<Hub> {
     let mut rx = resolve_hubs(timeout).await?;
     while let Some(hub) = rx.recv().await {
-        if let Some(user_data) = &hub.user_data {
-            if user_data.serial_number == serial {
+        if let Some(gateway_data) = &hub.gateway_data {
+            if gateway_data.serial_number == serial {
                 return Ok(hub.hub);
             }
         }
