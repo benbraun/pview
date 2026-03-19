@@ -286,11 +286,15 @@ async fn register_shades(
 
         let area = room_by_id.get(&shade.room_id).cloned();
         let device_id = format!("{serial}-{}", shade.id);
+        let shade_display_name = match &area {
+            Some(room) => format!("{room} {}", shade.pt_name),
+            None => shade.pt_name.clone(),
+        };
         let device = Device {
             suggested_area: area,
             identifiers: vec![device_id.clone()],
             via_device: Some(format!("{MODEL}-{serial}")),
-            name: shade.pt_name.clone(),
+            name: shade_display_name,
             manufacturer: HUNTER_DOUGLAS.to_string(),
             model: MODEL.to_string(),
             connections: vec![],
