@@ -83,6 +83,55 @@ impl ShadeData {
     pub fn pos2_percent(&self) -> Option<u8> {
         self.positions.pos2_percent()
     }
+
+    /// Returns a human-readable model name for the shade type, matching the
+    /// official Home Assistant PowerView integration's type mapping.
+    pub fn type_name(&self) -> &'static str {
+        match self.shade_type {
+            1 => "Designer Roller",
+            4 => "Roman",
+            5 => "Bottom Up",
+            6 => "Duette",
+            7 => "Top Down",
+            8 => "Duette, Top Down Bottom Up",
+            9 => "Duette DuoLite, Top Down Bottom Up",
+            10 => "Duette and Applause SkyLift",
+            18 => "Pirouette",
+            19 => "Provenance Woven Wood",
+            23 => "Silhouette",
+            26 => "Skyline Panel, Left Stack",
+            27 => "Skyline Panel, Right Stack",
+            28 => "Skyline Panel, Split Stack",
+            31 => "Vignette",
+            32 => "Vignette",
+            33 => "Duette Architella, Top Down Bottom Up",
+            38 => "Silhouette Duolite",
+            40 => "Everwood Alternative Wood Blinds",
+            42 => "M25T Roller Blind",
+            43 => "Facette",
+            44 => "Twist",
+            47 => "Pleated, Top Down Bottom Up",
+            49 => "AC Roller",
+            51 => "Venetian, Tilt Anywhere",
+            52 => "Banded Shades",
+            53 => "Sonnette",
+            54 => "Vertical Slats, Left Stack",
+            55 => "Vertical Slats, Right Stack",
+            56 => "Vertical Slats, Split Stack",
+            57 => "Carole Roman Shades",
+            62 => "Venetian, Tilt Anywhere",
+            65 => "Vignette Duolite",
+            66 => "Palm Beach Shutters",
+            69 => "Curtain, Left Stack",
+            70 => "Curtain, Right Stack",
+            71 => "Curtain, Split Stack",
+            72 => "Silhouette",
+            79 => "Duolite Lift",
+            84 => "Vignette",
+            95 => "Aura Illuminated, Roller",
+            _ => "PowerView Shade",
+        }
+    }
 }
 
 // ── ShadePosition ─────────────────────────────────────────────────────────────
