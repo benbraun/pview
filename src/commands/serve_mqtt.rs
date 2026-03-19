@@ -20,7 +20,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 
 const SECONDARY_SUFFIX: &str = "_middle";
 const MODEL: &str = "pv2mqtt";
@@ -930,6 +930,20 @@ impl ServeMqttCommand {
                     .publish(
                         format!(
                             "{MODEL}/shade/{serial}/{}/availability",
+                            event.id,
+                            serial = state.serial
+                        ),
+                        "offline",
+                        QoS::AtMostOnce,
+                        false,
+                    )
+                    .await?;
+                // Also mark secondary rail offline if present
+                state
+                    .client
+                    .publish(
+                        format!(
+                            "{MODEL}/shade/{serial}/{}{SECONDARY_SUFFIX}/availability",
                             event.id,
                             serial = state.serial
                         ),
