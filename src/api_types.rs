@@ -289,12 +289,36 @@ bitflags::bitflags! {
 
 // ── PowerType / BatteryStatus ─────────────────────────────────────────────────
 
-#[derive(Serialize_repr, Deserialize_repr, Debug, Copy, Clone, PartialEq, Eq)]
-#[repr(i32)]
+/// serde_repr does not support unknown integer fallback, so we use manual impls.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PowerType {
-    Battery = 0,
-    Hardwired = 1,
-    Rechargeable = 2,
+    Battery,
+    Hardwired,
+    Rechargeable,
+    Unknown(i32),
+}
+
+impl<'de> serde::Deserialize<'de> for PowerType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match i32::deserialize(d)? {
+            0 => Self::Battery,
+            1 => Self::Hardwired,
+            2 => Self::Rechargeable,
+            other => Self::Unknown(other),
+        })
+    }
+}
+
+impl serde::Serialize for PowerType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let v: i32 = match self {
+            Self::Battery => 0,
+            Self::Hardwired => 1,
+            Self::Rechargeable => 2,
+            Self::Unknown(n) => *n,
+        };
+        v.serialize(s)
+    }
 }
 
 #[derive(Serialize_repr, Deserialize_repr, Debug, Copy, Clone, PartialEq, Eq)]

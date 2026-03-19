@@ -165,6 +165,7 @@ fn power_type_to_state(power_type: PowerType) -> &'static str {
         PowerType::Hardwired => HARD_WIRED_LABEL,
         PowerType::Battery => BATTERY_LABEL,
         PowerType::Rechargeable => RECHARGEABLE_LABEL,
+        PowerType::Unknown(_) => BATTERY_LABEL,
     }
 }
 
