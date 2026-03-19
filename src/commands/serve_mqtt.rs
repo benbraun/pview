@@ -635,7 +635,7 @@ async fn advise_hass_of_position(
     Ok(())
 }
 
-/// Spawns a task that publishes interpolated shade position once per second
+/// Spawns a task that publishes interpolated shade position every 250ms
 /// until `eta_secs` elapses. The returned `AbortHandle` cancels it early.
 fn spawn_position_interpolation(
     state: Arc<Pv2MqttState>,
@@ -650,7 +650,7 @@ fn spawn_position_interpolation(
         let shade_id_str = format!("{shade_id}");
         let sec_id = format!("{shade_id}{SECONDARY_SUFFIX}");
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
             let elapsed = start_time.elapsed();
             let t = (elapsed.as_secs_f64() / eta_secs).min(1.0);
             if let (Some(s), Some(tgt)) = (start.pos1_percent(), target.pos1_percent()) {
@@ -967,12 +967,6 @@ impl ServeMqttCommand {
             }
             ShadeEventKind::MotionStarted => {
                 let shade_id_str = format!("{}", event.id);
-                log::info!(
-                    "MotionStarted id={} current={:?} target={:?}",
-                    event.id,
-                    event.current_positions,
-                    event.target_positions,
-                );
                 // Determine opening vs closing from target vs current positions
                 let motion_state = match (&event.current_positions, &event.target_positions) {
                     (Some(cur), Some(tgt)) => {
@@ -992,8 +986,7 @@ impl ServeMqttCommand {
                     (event.current_positions, event.target_positions)
                 {
                     if let Some(eta) = target.eta_in_seconds {
-                        let eta = (eta - 1.0).max(0.5);
-                        log::info!("Spawning interpolation for id={} eta={eta:.1}s", event.id);
+                        let eta = (eta - 1.5).max(0.5);
                         let abort = spawn_position_interpolation(
                             Arc::clone(state),
                             event.id,
@@ -1002,11 +995,7 @@ impl ServeMqttCommand {
                             eta,
                         );
                         state.motion_tasks.lock().unwrap().insert(event.id, abort);
-                    } else {
-                        log::info!("No interpolation for id={}: etaInSeconds absent from targetPositions", event.id);
                     }
-                } else {
-                    log::info!("No interpolation for id={}: missing currentPositions/targetPositions", event.id);
                 }
             }
             ShadeEventKind::ShadeOffline => {
