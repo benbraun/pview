@@ -165,12 +165,16 @@ impl Hub {
     }
 
     /// Activates a scene. Returns the list of affected shade ids.
-    /// v3 returns a bare JSON array, not a `{shadeIds:[...]}` wrapper.
     pub async fn activate_scene(&self, scene_id: i32) -> anyhow::Result<Vec<i32>> {
+        #[derive(serde::Deserialize)]
+        struct ActivateResponse {
+            #[serde(rename = "shadeIds")]
+            shade_ids: Vec<i32>,
+        }
         let url = self.url(&format!("home/scenes/{scene_id}/activate"));
-        let ids: Vec<i32> =
+        let resp: ActivateResponse =
             request_with_json_response(Method::PUT, url, &json!({})).await?;
-        Ok(ids)
+        Ok(resp.shade_ids)
     }
 
     pub async fn get_gateway_data(&self) -> anyhow::Result<GatewayConfig> {
