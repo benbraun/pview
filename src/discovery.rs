@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use wez_mdns::{QueryParameters, RecordKind};
 
-pub const POWERVIEW_SERVICE: &str = "_powerview._tcp.local";
+pub const POWERVIEW_SERVICE: &str = "_PowerView-G3._tcp.local";
 
 fn ip_from_response(response: wez_mdns::Response) -> anyhow::Result<IpAddr> {
     let mut ipv4 = None;
