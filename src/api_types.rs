@@ -1,299 +1,204 @@
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_repr::*;
-use std::convert::AsRef;
 
-// <https://github.com/jlaur/hdpowerview-doc/>
-// <https://github.com/openhab/openhab-addons/files/7583705/PowerView-Hub-REST-API-v2.pdf>
-// <https://github.com/openhab/openhab-addons/issues/11533>
+// PowerView Gen 3 API types
+// https://github.com/sander76/aio-powerview-api
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct RoomResponse {
-    pub room_data: Vec<RoomData>,
-    pub room_ids: Vec<u32>,
-}
-
-#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
-pub struct Base64Name(String);
-
-impl std::fmt::Display for Base64Name {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.0.fmt(fmt)
-    }
-}
-
-impl Base64Name {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for Base64Name {
-    type Target = String;
-    fn deref(&self) -> &String {
-        &self.0
-    }
-}
-
-impl AsRef<str> for Base64Name {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for Base64Name {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let text = String::deserialize(deserializer)?;
-        let decoded_bytes = data_encoding::BASE64
-            .decode(text.as_bytes())
-            .map_err(|e| D::Error::custom(format!("{e:#}")))?;
-        Ok(Base64Name(
-            String::from_utf8(decoded_bytes).map_err(|e| D::Error::custom(format!("{e:#}")))?,
-        ))
-    }
-}
-
-impl Serialize for Base64Name {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let encoded = data_encoding::BASE64.encode(&self.0.as_bytes());
-        encoded.serialize(serializer)
-    }
-}
+// ── Rooms ─────────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
 pub struct RoomData {
-    pub color_id: i32,
-    pub icon_id: i32,
     pub id: i32,
-    pub name: Base64Name,
-    pub order: i32,
+    pub pt_name: String,
+    pub name: String,   // raw base64, stored as-is
+    pub color: String,
+    pub icon: String,
     #[serde(rename = "type")]
-    pub room_type: RoomType,
+    pub room_type: i32,
 }
 
-#[derive(Serialize_repr, Deserialize_repr, Debug)]
-#[repr(i32)]
-pub enum RoomType {
-    Regular = 0,
-    Repeater = 1,
-    DefaultRoom = 2,
-}
+// ── Scenes ────────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct ShadesResponse {
-    pub shade_data: Vec<ShadeData>,
-    pub shade_ids: Vec<u32>,
+pub struct Scene {
+    pub id: i32,
+    pub pt_name: String,
+    pub name: String,   // raw base64, stored as-is
+    pub color: String,
+    pub icon: String,
+    pub network_number: i32,
+    pub room_ids: Vec<i32>,
 }
+
+// ── Shades ────────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
 pub struct ShadeData {
-    pub battery_status: BatteryStatus,
-    /// Battery level from 0-200
-    pub battery_strength: i32,
-    pub firmware: Option<ShadeFirmware>,
-    pub capabilities: ShadeCapabilities,
-    pub battery_kind: ShadeBatteryKind,
-    pub smart_power_supply: SmartPowerSupply,
-    /// Signal level from 0-4
-    pub signal_strength: Option<i32>,
-    pub motor: Option<Motor>,
-    pub group_id: i32,
     pub id: i32,
-    pub name: Option<Base64Name>,
-    /// Display order
-    pub order: Option<i32>,
-    pub positions: Option<ShadePosition>,
-    pub room_id: Option<i32>,
-    /// The secondary name of the shade base64 encoded. Used by the Apple Home application as the
-    /// secondary service name to control shades with blackout blinds or a top rail movement.
-    pub secondary_name: Option<Base64Name>,
     #[serde(rename = "type")]
-    pub shade_type: ShadeType,
-    #[serde(default)]
-    pub timed_out: bool,
+    pub shade_type: i32,
+    pub pt_name: String,
+    pub name: String,   // raw base64, stored as-is
+    pub capabilities: ShadeCapabilities,
+    pub power_type: PowerType,
+    pub battery_status: Option<BatteryStatus>, // nullable in v3; None = unavailable
+    pub room_id: i32,                          // always present in v3
+    pub firmware: ShadeFirmware,               // always present in v3
+    pub positions: ShadePosition,              // always present in v3
+    pub signal_strength: Option<f64>,          // RSSI in dBm, e.g. -55.0
+    pub ble_name: String,
+    pub shade_group_ids: Vec<i32>,
+    pub serial_number: String,
 }
 
 impl ShadeData {
     pub fn name(&self) -> &str {
-        self.name.as_ref().map(|s| s.as_str()).unwrap_or("unknown")
+        &self.pt_name
     }
 
-    pub fn secondary_name(&self) -> String {
-        if let Some(name) = &self.secondary_name {
-            name.as_str().to_string()
-        } else {
-            format!("{} Middle Rail", self.name())
-        }
-    }
-
+    /// Maps v3 BatteryStatus to a 0–100 percentage. Returns None when battery_status is None.
     pub fn battery_percent(&self) -> Option<u8> {
-        if self.battery_status == BatteryStatus::Unavailable {
-            None
-        } else {
-            Some((self.battery_strength / 2) as u8)
+        match self.battery_status? {
+            BatteryStatus::NoPower => Some(0),
+            BatteryStatus::Low => Some(20),
+            BatteryStatus::Medium => Some(50),
+            BatteryStatus::High => Some(100),
         }
     }
 
+    /// Maps RSSI dBm to 0–100%: -100 dBm → 0%, -50 dBm → 100%, clamped.
     pub fn signal_strength_percent(&self) -> Option<u8> {
         self.signal_strength
-            .map(|level| ((level as u16) * 100 / 4) as u8)
+            .map(|dbm| ((dbm + 100.0) * 2.0).clamp(0.0, 100.0) as u8)
     }
 
     pub fn pos1_percent(&self) -> Option<u8> {
-        self.positions.as_ref().map(|p| p.pos1_percent())
+        self.positions.pos1_percent()
     }
 
     pub fn pos2_percent(&self) -> Option<u8> {
-        self.positions.as_ref().and_then(|p| p.pos2_percent())
+        self.positions.pos2_percent()
     }
 }
 
-#[derive(Serialize_repr, Deserialize_repr, Debug, PartialEq, Eq)]
-#[repr(i32)]
-pub enum BatteryStatus {
-    Unavailable = 0,
-    Low = 1,
-    Medium = 2,
-    High = 3,
-    PluggedIn = 4,
-}
+// ── ShadePosition ─────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Debug)]
+/// Named float fields (0.0–1.0). Fields with `skip_serializing_if` allow partial PUT updates —
+/// the v3 hub preserves axes not included in the request body.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct ShadeFirmware {
-    pub build: i32,
-    pub index: Option<i32>,
-    pub revision: i32,
-    pub sub_revision: i32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
 pub struct ShadePosition {
-    pub pos_kind_1: PositionKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pos_kind_2: Option<PositionKind>,
-    pub position_1: u16,
+    pub primary: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub position_2: Option<u16>,
+    pub secondary: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tilt: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub velocity: Option<f64>,
 }
 
 impl ShadePosition {
-    pub fn describe(&self) -> String {
-        if let Some(pos2) = self.position_2 {
-            format!(
-                "{} {}",
-                self.describe_pos(self.position_1),
-                self.describe_pos(pos2)
-            )
-        } else {
-            self.describe_pos(self.position_1)
-        }
+    pub fn pos_to_percent(v: f64) -> u8 {
+        (v * 100.0).round() as u8
     }
 
-    pub fn pos_to_percent(pos: u16) -> u8 {
-        (100u32 * pos as u32 / u16::max_value() as u32) as u8
+    pub fn percent_to_pos(pct: u8) -> f64 {
+        pct as f64 / 100.0
     }
 
-    pub fn percent_to_pos(pct: u8) -> u16 {
-        ((u16::max_value() as u32) * (pct as u32) / 100u32) as u16
-    }
-
-    pub fn pos1_percent(&self) -> u8 {
-        Self::pos_to_percent(self.position_1)
+    pub fn pos1_percent(&self) -> Option<u8> {
+        self.primary.map(Self::pos_to_percent)
     }
 
     pub fn pos2_percent(&self) -> Option<u8> {
-        self.position_2.map(Self::pos_to_percent)
+        self.secondary.map(Self::pos_to_percent)
     }
 
     pub fn describe_pos1(&self) -> String {
-        self.describe_pos(self.position_1)
+        self.primary
+            .map(|v| format!("{}%", Self::pos_to_percent(v)))
+            .unwrap_or_default()
     }
 
     pub fn describe_pos2(&self) -> String {
-        if let Some(pos2) = self.position_2 {
-            self.describe_pos(pos2)
+        self.secondary
+            .map(|v| format!("{}%", Self::pos_to_percent(v)))
+            .unwrap_or_default()
+    }
+
+    pub fn describe(&self) -> String {
+        let mut parts = vec![];
+        if let Some(p) = self.primary {
+            parts.push(format!("primary: {}%", Self::pos_to_percent(p)));
+        }
+        if let Some(s) = self.secondary {
+            parts.push(format!("secondary: {}%", Self::pos_to_percent(s)));
+        }
+        if let Some(t) = self.tilt {
+            parts.push(format!("tilt: {}%", Self::pos_to_percent(t)));
+        }
+        if parts.is_empty() {
+            "unknown".to_string()
         } else {
-            String::new()
+            parts.join("  ")
         }
     }
-
-    pub fn describe_pos(&self, pos: u16) -> String {
-        format!("{}%", Self::pos_to_percent(pos))
-    }
 }
 
-#[derive(Serialize_repr, Deserialize_repr, Debug, Clone, Copy)]
-#[repr(i32)]
-pub enum PositionKind {
-    None = 0,
-    PrimaryRail = 1,
-    SecondaryRail = 2,
-    VaneTilt = 3,
-    Error = 4,
+// ── ShadeFirmware ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadeFirmware {
+    pub revision: i32,
+    pub sub_revision: i32,
+    pub build: i32,
 }
 
-#[derive(Serialize_repr, Deserialize_repr, Debug)]
-#[repr(i32)]
-pub enum ShadeType {
-    Roller = 1,
-    Type2 = 2,
-    Roman = 4,
-    Type5 = 5,
-    Duette = 6,
-    TopDown = 7,
-    DuetteTopDownBottomUp = 8,
-    DuetteDuoLiteTopDownBottomUp = 9,
-    Piroutte = 18,
-    Silhouette = 23,
-    SilhouetteDuolite = 38,
-    RollerBlind = 42,
-    Facette = 43,
-    Twist = 44,
-    PleatedTopDownBottomUp = 47,
-    ACRoller = 49,
-    Venetian = 51,
-    VerticalSlatsLeftStack = 54,
-    VerticalSlatsRightStack = 55,
-    VerticalSlatsSplitStack = 56,
-    Venetian62 = 62,
-    VignetteDuolite = 65,
-    Shutter = 66,
-    CurtainLeftStack = 69,
-    CurtainRightStack = 70,
-    CurtainSplitStack = 71,
-    DuoliteLift = 79,
-}
+// ── ShadeCapabilities ─────────────────────────────────────────────────────────
 
-#[derive(Serialize_repr, Deserialize_repr, Debug, Copy, Clone)]
-#[repr(i32)]
+/// serde_repr does not support `#[serde(other)]`, so we implement manual Deserialize
+/// with an `Unknown(i32)` fallback for forward compatibility.
+#[derive(Serialize, Debug, Copy, Clone)]
 pub enum ShadeCapabilities {
-    BottomUp = 0,
-    BottomUpTilt90 = 1,
-    BottomUpTilt180 = 2,
-    VerticalTilt180 = 3,
-    Vertical = 4,
-    TiltOnly180 = 5,
-    TopDown = 6,
-    TopDownBottomUp = 7,
-    DualOverlapped = 8,
-    DualOverlappedTilt90 = 9,
+    BottomUp,             // 0
+    BottomUpTilt90,       // 1
+    BottomUpTilt180,      // 2
+    VerticalTilt180,      // 3
+    Vertical,             // 4
+    TiltOnly180,          // 5
+    TopDown,              // 6
+    TopDownBottomUp,      // 7
+    DualOverlapped,       // 8
+    DualOverlappedTilt90, // 9
+    DuoliteTilt180,       // 10
+    Illuminated,          // 11
+    Unknown(i32),         // forward compatibility; flags() returns empty
+}
+
+impl<'de> Deserialize<'de> for ShadeCapabilities {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = i32::deserialize(d)?;
+        Ok(match v {
+            0 => Self::BottomUp,
+            1 => Self::BottomUpTilt90,
+            2 => Self::BottomUpTilt180,
+            3 => Self::VerticalTilt180,
+            4 => Self::Vertical,
+            5 => Self::TiltOnly180,
+            6 => Self::TopDown,
+            7 => Self::TopDownBottomUp,
+            8 => Self::DualOverlapped,
+            9 => Self::DualOverlappedTilt90,
+            10 => Self::DuoliteTilt180,
+            11 => Self::Illuminated,
+            other => Self::Unknown(other),
+        })
+    }
 }
 
 impl ShadeCapabilities {
@@ -334,6 +239,16 @@ impl ShadeCapabilities {
                     | ShadeCapabilityFlags::SECONDARY_RAIL_OVERLAPPED
                     | ShadeCapabilityFlags::TILT_ON_CLOSED
             }
+            Self::DuoliteTilt180 => {
+                ShadeCapabilityFlags::PRIMARY_RAIL
+                    | ShadeCapabilityFlags::SECONDARY_RAIL
+                    | ShadeCapabilityFlags::TILT_ANYWHERE
+                    | ShadeCapabilityFlags::TILT_180
+            }
+            Self::Illuminated => {
+                ShadeCapabilityFlags::PRIMARY_RAIL | ShadeCapabilityFlags::SECONDARY_RAIL
+            }
+            Self::Unknown(_) => ShadeCapabilityFlags::empty(),
         }
     }
 }
@@ -350,148 +265,66 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Serialize_repr, Deserialize_repr, Debug, Copy, Clone)]
+// ── PowerType / BatteryStatus ─────────────────────────────────────────────────
+
+#[derive(Serialize_repr, Deserialize_repr, Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(i32)]
-pub enum ShadeBatteryKind {
-    HardWiredPowerSupply = 1,
-    BatteryWand = 2,
-    RechargeableBattery = 3,
+pub enum PowerType {
+    Battery = 0,
+    Hardwired = 1,
+    Rechargeable = 2,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct SmartPowerSupply {
-    pub status: i32,
-    pub id: i32,
-    pub port: i32,
+#[derive(Serialize_repr, Deserialize_repr, Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(i32)]
+pub enum BatteryStatus {
+    NoPower = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct Motor {
-    pub revision: i32,
-    pub sub_revision: i32,
-    pub build: i32,
-}
+// ── ShadeUpdateMotion ─────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
 pub enum ShadeUpdateMotion {
     Down,
-    Heart,
     Jog,
     LeftTilt,
     RightTilt,
     Stop,
     Up,
-    Calibrate,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct Scene {
-    pub color_id: i32,
-    pub icon_id: i32,
-    pub id: i32,
-    pub name: Base64Name,
-    pub network_number: i32,
-    pub order: i32,
-    pub room_id: i32,
-    pub hk_assist: bool,
-}
+// ── Gateway / Hub ─────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct ScenesResponse {
-    pub scene_data: Vec<Scene>,
-    pub scene_ids: Vec<u32>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct SceneMember {
-    pub id: i32,
-    pub scene_id: i32,
-    pub shade_id: i32,
-    #[serde(rename = "type")]
-    pub member_type: i32,
-    pub positions: ShadePosition,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct SceneMembersResponse {
-    pub scene_member_data: Vec<SceneMember>,
-    pub scene_member_ids: Vec<u32>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct UserDataResponse {
-    pub user_data: UserData,
+/// Internal wrapper: v3 GET /gateway nests the config under a "config" key.
+#[derive(Deserialize)]
+pub(crate) struct GatewayResponse {
+    pub config: GatewayConfig,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct UserData {
-    pub hub_name: Base64Name,
-    pub local_time_data_set: bool,
-    pub enable_scheduled_events: bool,
-    pub editing_enabled: bool,
-    pub setup_completed: bool,
-    /// network router gateway
-    pub gateway: String,
-    /// dns server
-    pub dns: String,
-    /// whether the IP is statically configured
-    pub static_ip: bool,
-    #[serde(rename = "_id")]
-    pub id: String,
-    /// The color of the light and repeaters
-    pub color: Color,
-    pub auto_backup: bool,
-    /// Current ip address
-    pub ip: String,
-    pub mac_address: String,
-    /// netmask
-    pub mask: String,
-    /// whether it is in AP mode
-    pub wireless: bool,
-    /// the ssid of AP mode
-    pub ssid: Option<String>,
-    pub firmware: FirmwareInfo,
+pub struct GatewayConfig {
     pub serial_number: String,
-    #[serde(rename = "rfIDInt")]
-    pub rf_id_int: u32,
-    #[serde(rename = "rfID")]
-    pub rf_id: String,
-    pub rf_status: i32,
-    pub times: TimeConfiguration,
     pub brand: String,
-    pub rc_up: bool,
-    pub remote_connect_enabled: bool,
+    pub model: String,
+    pub firmware: GatewayFirmwareVersions,
+    pub network_status: GatewayNetworkStatus,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct FirmwareInfo {
-    pub main_processor: MainProcessorFirmware,
-    pub radio: MainProcessorFirmware,
+pub struct GatewayFirmwareVersions {
+    pub main_processor: GatewayFirmware,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct MainProcessorFirmware {
-    pub name: Option<String>,
+pub struct GatewayFirmware {
+    pub name: String,
     pub revision: i32,
     pub sub_revision: i32,
     pub build: i32,
@@ -499,65 +332,33 @@ pub struct MainProcessorFirmware {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct Color {
-    pub red: u8,
-    pub green: u8,
-    pub blue: u8,
-    pub brightness: u8,
+pub struct GatewayNetworkStatus {
+    pub ip_address: String,
+    pub primary_mac_address: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct TimeConfiguration {
-    pub timezone: String,
-    pub local_sunrise_time_in_minutes: i64,
-    pub local_sunset_time_in_minutes: i64,
-    pub current_offset: i64,
-    pub longitude: Option<f64>,
-    pub latitude: Option<f64>,
-}
+// ── SSE Events ────────────────────────────────────────────────────────────────
 
+/// Wire format: JSON in SSE `data:` lines, delimited by blank lines.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct HomeAutomationPostBackData {
-    pub duration_ms: Option<i64>,
-    pub remaining_duration_ms: Option<i64>,
-    pub initial_position: Option<u8>,
-    pub service: HomeAutomationService,
-    pub shade_id: i32,
-    pub target_position: Option<u8>,
-    pub current_position: Option<u8>,
-    #[serde(rename = "type")]
-    pub record_type: HomeAutomationRecordType,
-    pub stopped_position: Option<u8>,
+pub struct ShadeEvent {
+    pub evt: ShadeEventKind,
+    pub id: i32,
+    pub current_positions: Option<ShadePosition>,
+    pub iso_date: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, clap::ValueEnum)]
-#[serde(rename_all = "camelCase")]
-pub enum HomeAutomationService {
-    Primary,
-    Secondary,
-}
-
-// Note that the order of the enum variants is significant!
-// We want the final state items to sort after the others,
-// otherwise we'll send incorrect state updates to hass.
-#[derive(
-    Serialize, Deserialize, Debug, Clone, Copy, clap::ValueEnum, Ord, PartialOrd, Eq, PartialEq,
-)]
-#[serde(rename_all = "camelCase")]
-pub enum HomeAutomationRecordType {
-    StartsOpening,
-    StartsClosing,
-    BeginsMoving,
-    TargetLevelChanged,
-    LevelChanged,
-    HasOpened,
-    HasFullyOpened,
-    HasFullyClosed,
-    HasClosed,
-    Stops,
+/// `#[serde(other)]` on `Unknown` provides forward compatibility:
+/// any unrecognised evt string deserializes as Unknown instead of an error.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShadeEventKind {
+    ShadeOffline,
+    ShadeOnline,
+    MotionStarted,
+    MotionStopped,
+    BatteryAlert,
+    #[serde(other)]
+    Unknown,
 }
