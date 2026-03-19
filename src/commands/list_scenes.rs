@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use tabout::{Alignment, Column};
 
-/// List scenes and their associated shades
+/// List scenes and their associated rooms
 #[derive(clap::Parser, Debug)]
 pub struct ListScenesCommand {
-    /// Only return shades in the specified room
+    /// Only return scenes in the specified room
     #[clap(long)]
     room: Option<String>,
 }
@@ -16,50 +16,30 @@ impl ListScenesCommand {
 
         if let Some(room) = &self.room {
             let room = hub.room_by_name(room).await?;
-            scenes.retain(|scene| scene.room_id == room.id);
+            scenes.retain(|scene| scene.room_ids.contains(&room.id));
         }
 
-        let shade_by_id: HashMap<_, _> = hub
-            .list_shades(None, None)
+        let room_by_id: HashMap<i32, String> = hub
+            .list_rooms()
             .await?
             .into_iter()
-            .map(|shade| (shade.id, shade))
+            .map(|r| (r.id, r.pt_name))
             .collect();
 
-        let mut members_by_scene = hub.list_scene_members().await?;
-
         let columns = &[
-            Column {
-                name: "SCENE/SHADES".to_string(),
-                alignment: Alignment::Left,
-            },
-            Column {
-                name: "POSITION".to_string(),
-                alignment: Alignment::Right,
-            },
+            Column { name: "SCENE".to_string(), alignment: Alignment::Left },
+            Column { name: "ROOMS".to_string(), alignment: Alignment::Left },
         ];
         let mut rows = vec![];
-
-        for scene in scenes {
-            rows.push(vec![scene.name.to_string()]);
-            if let Some(members) = members_by_scene.get_mut(&scene.id) {
-                members.sort_by_key(|m| {
-                    let shade = &shade_by_id[&m.shade_id];
-                    (shade.order, shade.name())
-                });
-
-                for m in members {
-                    let shade = &shade_by_id[&m.shade_id];
-                    rows.push(vec![
-                        format!("    {}", shade.name()),
-                        m.positions.describe(),
-                    ]);
-                }
-            }
-            rows.push(vec![]);
+        for scene in &scenes {
+            let room_names: Vec<&str> = scene
+                .room_ids
+                .iter()
+                .filter_map(|id| room_by_id.get(id).map(|s| s.as_str()))
+                .collect();
+            rows.push(vec![scene.pt_name.clone(), room_names.join(", ")]);
         }
         println!("{}", tabout::tabulate_output_as_string(columns, &rows)?);
-
         Ok(())
     }
 }
