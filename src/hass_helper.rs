@@ -83,6 +83,7 @@ pub struct SensorConfig {
     pub base: EntityConfig,
 
     pub state_topic: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unit_of_measurement: Option<String>,
 }
 
