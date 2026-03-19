@@ -97,3 +97,16 @@ pub struct ButtonConfig {
     pub payload_press: Option<String>,
 }
 
+#[derive(Serialize, Clone, Debug)]
+pub struct NumberConfig {
+    #[serde(flatten)]
+    pub base: EntityConfig,
+
+    pub state_topic: String,
+    pub command_topic: String,
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+    pub mode: String,
+}
+
