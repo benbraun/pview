@@ -270,16 +270,20 @@ async fn register_shades(
 
     for shade in &shades {
         let position = &shade.positions;
-        let mut shade_ids = vec![(shade.id.to_string(), None, position.pos1_percent())];
-
-        if shade
+        let has_secondary = shade
             .capabilities
             .flags()
-            .contains(ShadeCapabilityFlags::SECONDARY_RAIL)
-        {
+            .contains(ShadeCapabilityFlags::SECONDARY_RAIL);
+
+        // For TDBU shades the primary rail is the bottom and the secondary is the top.
+        // Give them explicit names so HA shows "Bottom" and "Top" under one device.
+        let primary_name = if has_secondary { Some("Bottom".to_string()) } else { None };
+        let mut shade_ids = vec![(shade.id.to_string(), primary_name, position.pos1_percent())];
+
+        if has_secondary {
             shade_ids.push((
                 format!("{}{SECONDARY_SUFFIX}", shade.id),
-                Some("Middle Rail".to_string()),
+                Some("Top".to_string()),
                 position.pos2_percent(),
             ));
         }
