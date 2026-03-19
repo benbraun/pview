@@ -1,4 +1,4 @@
-use crate::api_types::{ShadePosition, ShadeUpdateMotion};
+use crate::api_types::{ShadeCapabilityFlags, ShadePosition, ShadeUpdateMotion};
 
 #[derive(clap::Args, Debug)]
 #[group(required = true)]
@@ -39,6 +39,12 @@ impl MoveShadeCommand {
             hub.set_shade_position(shade.id, pos).await?;
             println!("Set {} (id={}) primary to {percent}%", shade.pt_name, shade.id);
         } else if let Some(percent) = self.target_position.secondary_percent {
+            anyhow::ensure!(
+                shade.capabilities.flags().contains(ShadeCapabilityFlags::SECONDARY_RAIL),
+                "{} (id={}) does not have a secondary rail",
+                shade.pt_name,
+                shade.id
+            );
             let pos = ShadePosition {
                 secondary: Some(ShadePosition::percent_to_pos(percent)),
                 ..Default::default()
