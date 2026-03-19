@@ -85,14 +85,75 @@ impl Hub {
         get_request_with_json_response(self.url(&format!("home/shades/{shade_id}"))).await
     }
 
+    /// Look up a shade by name or id.
+    ///
+    /// Accepts:
+    /// - A numeric id
+    /// - `"Shade Name"` — matches if exactly one shade has that name; errors with
+    ///   suggestions if multiple shades share the name
+    /// - `"Room Name/Shade Name"` — unambiguous room-qualified lookup
     pub async fn shade_by_name(&self, name: &str) -> anyhow::Result<ShadeData> {
-        let shades = self.list_shades(None).await?;
-        for shade in shades {
-            if shade.pt_name.eq_ignore_ascii_case(name) || shade.id.to_string() == name {
+        let (shades, rooms) =
+            tokio::try_join!(self.list_shades(None), self.list_rooms())?;
+        let room_name_by_id: std::collections::HashMap<i32, &str> =
+            rooms.iter().map(|r| (r.id, r.pt_name.as_str())).collect();
+
+        // Numeric id shortcut
+        if let Ok(id) = name.parse::<i32>() {
+            if let Some(shade) = shades.into_iter().find(|s| s.id == id) {
                 return Ok(shade);
             }
+            anyhow::bail!("No shade with id {id} was found");
         }
-        anyhow::bail!("No shade with name or id matching '{name}' was found");
+
+        // "Room/Shade" qualified lookup
+        if let Some((room_part, shade_part)) = name.split_once('/') {
+            let room_part = room_part.trim();
+            let shade_part = shade_part.trim();
+            let mut matched: Vec<ShadeData> = shades
+                .into_iter()
+                .filter(|s| {
+                    s.pt_name.eq_ignore_ascii_case(shade_part)
+                        && room_name_by_id
+                            .get(&s.room_id)
+                            .map(|r| r.eq_ignore_ascii_case(room_part))
+                            .unwrap_or(false)
+                })
+                .collect();
+            return match matched.len() {
+                1 => Ok(matched.remove(0)),
+                0 => anyhow::bail!("No shade matching '{name}' was found"),
+                _ => anyhow::bail!(
+                    "Multiple shades match '{name}'; use the numeric id instead"
+                ),
+            };
+        }
+
+        // Bare name lookup — error if ambiguous
+        let matched: Vec<ShadeData> = shades
+            .into_iter()
+            .filter(|s| s.pt_name.eq_ignore_ascii_case(name))
+            .collect();
+        match matched.len() {
+            1 => Ok(matched.into_iter().next().unwrap()),
+            0 => anyhow::bail!("No shade with name or id matching '{name}' was found"),
+            _ => {
+                let suggestions: Vec<String> = matched
+                    .iter()
+                    .map(|s| {
+                        let room = room_name_by_id
+                            .get(&s.room_id)
+                            .copied()
+                            .unwrap_or("unknown");
+                        format!("  {room}/{name}")
+                    })
+                    .collect();
+                anyhow::bail!(
+                    "Multiple shades named '{name}' found. Use room-qualified name:\n{}",
+                    suggestions.join("\n")
+                )
+            }
+        }
     }
 
     /// Sends a motion command to the hub.
