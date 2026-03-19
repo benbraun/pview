@@ -392,6 +392,8 @@ pub struct ShadeEvent {
     pub evt: ShadeEventKind,
     pub id: i32,
     pub current_positions: Option<ShadePosition>,
+    pub target_positions: Option<ShadePosition>,
+    pub eta_in_seconds: Option<f64>,
     pub iso_date: Option<String>,
 }
 

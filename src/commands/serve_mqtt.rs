@@ -635,6 +635,40 @@ async fn advise_hass_of_position(
     Ok(())
 }
 
+/// Spawns a task that publishes interpolated shade position once per second
+/// until `eta_secs` elapses. The returned `AbortHandle` cancels it early.
+fn spawn_position_interpolation(
+    state: Arc<Pv2MqttState>,
+    shade_id: i32,
+    start: ShadePosition,
+    target: ShadePosition,
+    eta_secs: f64,
+) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        let start_time = tokio::time::Instant::now();
+        let eta = Duration::from_secs_f64(eta_secs);
+        let shade_id_str = format!("{shade_id}");
+        let sec_id = format!("{shade_id}{SECONDARY_SUFFIX}");
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let elapsed = start_time.elapsed();
+            let t = (elapsed.as_secs_f64() / eta_secs).min(1.0);
+            if let (Some(s), Some(tgt)) = (start.pos1_percent(), target.pos1_percent()) {
+                let pct = (s as f64 + (tgt as f64 - s as f64) * t).round() as u8;
+                let _ = advise_hass_of_position(&state, &shade_id_str, pct).await;
+            }
+            if let (Some(s), Some(tgt)) = (start.pos2_percent(), target.pos2_percent()) {
+                let pct = (s as f64 + (tgt as f64 - s as f64) * t).round() as u8;
+                let _ = advise_hass_of_position(&state, &sec_id, pct).await;
+            }
+            if elapsed >= eta {
+                break;
+            }
+        }
+    });
+    handle.abort_handle()
+}
+
 async fn advise_hass_of_updated_position(
     state: &Arc<Pv2MqttState>,
     shade: &ShadeData,
@@ -723,6 +757,7 @@ impl ServeMqttCommand {
             discovery_prefix: self.discovery_prefix.clone(),
             first_run: AtomicBool::new(true),
             responding: AtomicBool::new(true),
+            motion_tasks: std::sync::Mutex::new(HashMap::new()),
         });
 
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
@@ -911,6 +946,10 @@ impl ServeMqttCommand {
         let hub = state.hub.load();
         match event.evt {
             ShadeEventKind::MotionStopped => {
+                // Cancel any in-progress interpolation for this shade
+                if let Some(handle) = state.motion_tasks.lock().unwrap().remove(&event.id) {
+                    handle.abort();
+                }
                 if let Some(positions) = &event.current_positions {
                     let shade_id_str = format!("{}", event.id);
                     if let Some(pct) = positions.pos1_percent() {
@@ -927,7 +966,34 @@ impl ServeMqttCommand {
                 }
             }
             ShadeEventKind::MotionStarted => {
-                advise_hass_of_state_label(state, &format!("{}", event.id), "moving").await?;
+                let shade_id_str = format!("{}", event.id);
+                // Determine opening vs closing from target vs current positions
+                let motion_state = match (&event.current_positions, &event.target_positions) {
+                    (Some(cur), Some(tgt)) => {
+                        let cur_pct = cur.pos1_percent().unwrap_or(0);
+                        let tgt_pct = tgt.pos1_percent().unwrap_or(0);
+                        if tgt_pct >= cur_pct { "opening" } else { "closing" }
+                    }
+                    _ => "opening",
+                };
+                advise_hass_of_state_label(state, &shade_id_str, motion_state).await?;
+                // Cancel any previous interpolation task for this shade
+                if let Some(handle) = state.motion_tasks.lock().unwrap().remove(&event.id) {
+                    handle.abort();
+                }
+                // Spawn position interpolation if we have enough data
+                if let (Some(current), Some(target), Some(eta)) =
+                    (event.current_positions, event.target_positions, event.eta_in_seconds)
+                {
+                    let abort = spawn_position_interpolation(
+                        Arc::clone(state),
+                        event.id,
+                        current,
+                        target,
+                        eta,
+                    );
+                    state.motion_tasks.lock().unwrap().insert(event.id, abort);
+                }
             }
             ShadeEventKind::ShadeOffline => {
                 state
@@ -1169,6 +1235,18 @@ async fn mqtt_shade_set_position(
         shade.pt_name,
         if is_secondary { "secondary" } else { "primary" }
     );
+    let shade_id_str = if is_secondary {
+        format!("{shade_id}{SECONDARY_SUFFIX}")
+    } else {
+        format!("{shade_id}")
+    };
+    let current = if is_secondary { shade.pos2_percent() } else { shade.pos1_percent() };
+    let motion_state = match current {
+        Some(cur) if position > cur => "opening",
+        Some(cur) if position < cur => "closing",
+        _ => "opening", // unknown current position; assume opening
+    };
+    advise_hass_of_state_label(&state, &shade_id_str, motion_state).await?;
     hub.hub.set_shade_position(shade_id, pos).await?;
     Ok(())
 }
@@ -1200,11 +1278,14 @@ async fn mqtt_shade_command(
     let shade = hub.hub.shade_by_id(shade_id).await?;
 
     log::info!("{command} {shade_id} {}", shade.pt_name);
+    let shade_id_str = format!("{shade_id}");
     match command.as_ref() {
         "OPEN" => {
+            advise_hass_of_state_label(&state, &shade_id_str, "opening").await?;
             hub.hub.move_shade(shade_id, ShadeUpdateMotion::Up).await?;
         }
         "CLOSE" => {
+            advise_hass_of_state_label(&state, &shade_id_str, "closing").await?;
             hub.hub.move_shade(shade_id, ShadeUpdateMotion::Down).await?;
         }
         "STOP" => {
@@ -1242,6 +1323,7 @@ struct Pv2MqttState {
     discovery_prefix: String,
     first_run: AtomicBool,
     responding: AtomicBool,
+    motion_tasks: std::sync::Mutex<HashMap<i32, tokio::task::AbortHandle>>,
 }
 
 impl Pv2MqttState {
