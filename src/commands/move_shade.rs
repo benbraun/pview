@@ -8,7 +8,7 @@ struct TargetPosition {
     /// Set the primary rail position (0–100)
     #[arg(long, group = "position")]
     percent: Option<u8>,
-    /// Set the secondary (middle) rail position (0–100)
+    /// Set the secondary (top) rail position (0–100)
     #[arg(long, group = "position")]
     secondary_percent: Option<u8>,
 }
