@@ -100,6 +100,9 @@ pub struct ShadePosition {
     pub tilt: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub velocity: Option<f64>,
+    /// Only present in SSE `targetPositions`; not sent on PUT requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_in_seconds: Option<f64>,
 }
 
 impl ShadePosition {
@@ -393,7 +396,6 @@ pub struct ShadeEvent {
     pub id: i32,
     pub current_positions: Option<ShadePosition>,
     pub target_positions: Option<ShadePosition>,
-    pub eta_in_seconds: Option<f64>,
     pub iso_date: Option<String>,
 }
 

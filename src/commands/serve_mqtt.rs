@@ -967,6 +967,12 @@ impl ServeMqttCommand {
             }
             ShadeEventKind::MotionStarted => {
                 let shade_id_str = format!("{}", event.id);
+                log::info!(
+                    "MotionStarted id={} current={:?} target={:?}",
+                    event.id,
+                    event.current_positions,
+                    event.target_positions,
+                );
                 // Determine opening vs closing from target vs current positions
                 let motion_state = match (&event.current_positions, &event.target_positions) {
                     (Some(cur), Some(tgt)) => {
@@ -982,17 +988,24 @@ impl ServeMqttCommand {
                     handle.abort();
                 }
                 // Spawn position interpolation if we have enough data
-                if let (Some(current), Some(target), Some(eta)) =
-                    (event.current_positions, event.target_positions, event.eta_in_seconds)
+                if let (Some(current), Some(target)) =
+                    (event.current_positions, event.target_positions)
                 {
-                    let abort = spawn_position_interpolation(
-                        Arc::clone(state),
-                        event.id,
-                        current,
-                        target,
-                        eta,
-                    );
-                    state.motion_tasks.lock().unwrap().insert(event.id, abort);
+                    if let Some(eta) = target.eta_in_seconds {
+                        log::info!("Spawning interpolation for id={} eta={eta:.1}s", event.id);
+                        let abort = spawn_position_interpolation(
+                            Arc::clone(state),
+                            event.id,
+                            current,
+                            target,
+                            eta,
+                        );
+                        state.motion_tasks.lock().unwrap().insert(event.id, abort);
+                    } else {
+                        log::info!("No interpolation for id={}: etaInSeconds absent from targetPositions", event.id);
+                    }
+                } else {
+                    log::info!("No interpolation for id={}: missing currentPositions/targetPositions", event.id);
                 }
             }
             ShadeEventKind::ShadeOffline => {
