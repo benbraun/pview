@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 
-const SECONDARY_SUFFIX: &str = "_middle";
+const SECONDARY_SUFFIX: &str = "_top";
 const MODEL: &str = "pv2mqtt";
 const WEZ: &str = "Wez Furlong";
 const HUNTER_DOUGLAS: &str = "Hunter Douglas";
