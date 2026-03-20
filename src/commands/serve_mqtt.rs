@@ -1315,7 +1315,13 @@ async fn mqtt_shade_set_position(
     let motion_state = match current {
         Some(cur) if position > cur => "opening",
         Some(cur) if position < cur => "closing",
-        _ => "opening", // unknown current position; assume opening
+        Some(cur) => {
+            log::info!(
+                "Shade {shade_id} already at {cur}%, skipping duplicate set-position command"
+            );
+            return Ok(());
+        }
+        None => "opening", // unknown current position; assume opening
     };
     advise_hass_of_state_label(&state, &shade_id_str, motion_state).await?;
     hub.hub.set_shade_position(shade_id, pos).await?;
@@ -1352,6 +1358,11 @@ async fn mqtt_shade_command(
     let shade_id_str = format!("{shade_id}");
     match command.as_ref() {
         "OPEN" => {
+            let cur = shade.pos1_percent();
+            if cur == Some(100) {
+                log::info!("Shade {shade_id} already open, skipping duplicate OPEN command");
+                return Ok(());
+            }
             advise_hass_of_state_label(&state, &shade_id_str, "opening").await?;
             let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
             hub.hub
@@ -1366,6 +1377,11 @@ async fn mqtt_shade_command(
                 .await?;
         }
         "CLOSE" => {
+            let cur = shade.pos1_percent();
+            if cur == Some(0) {
+                log::info!("Shade {shade_id} already closed, skipping duplicate CLOSE command");
+                return Ok(());
+            }
             advise_hass_of_state_label(&state, &shade_id_str, "closing").await?;
             let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
             hub.hub
