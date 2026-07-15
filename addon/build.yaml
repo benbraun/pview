@@ -1,7 +1,7 @@
 labels:
   org.opencontainers.image.title: "Home Assistant Add-on: PowerView MQTT Bridge"
   org.opencontainers.image.description: "Acts as a bridge between a Hunter Douglas PowerView Hub and Home Assistant, via the Home Assistant MQTT Integration."
-  org.opencontainers.image.source: "https://github.com/wez/pview"
+  org.opencontainers.image.source: "https://github.com/benbraun/pview"
   org.opencontainers.image.licenses: "MIT"
 
 # Keep in sync with https://github.com/home-assistant/builder/blob/master/build.yaml
@@ -10,6 +10,12 @@ build_from:
   armv7: "ghcr.io/home-assistant/armv7-base:3.21"
   amd64: "ghcr.io/home-assistant/amd64-base:3.21"
 
+# Build args passed to addon/Dockerfile. On release, scripts/apply-tag.sh
+# pins PVIEW_REF to the release tag so the addon builds exactly that code.
+args:
+  PVIEW_REPO: "https://github.com/benbraun/pview.git"
+  PVIEW_REF: "main"
+
 cosign:
-  identity: https://github.com/wez/pview/.*
+  identity: https://github.com/benbraun/pview/.*
   base_identity: https://github.com/home-assistant/docker-base/.*
