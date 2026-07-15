@@ -55,6 +55,6 @@ Worker threads are intentionally limited to 2 (`#[tokio::main(worker_threads = 2
 
 ## References
 
-- **Repository**: https://github.com/wez/pview
+- **Repository**: https://github.com/benbraun/pview (fork of https://github.com/wez/pview)
 - **HA PowerView integration** (reference for Gen 3 API behaviour): https://github.com/home-assistant/core/tree/dev/homeassistant/components/hunterdouglas_powerview
 - **aiopvapi** (Python library used by HA integration, useful for API details): https://github.com/sander76/aio-powerview-api
