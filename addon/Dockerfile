@@ -1,4 +1,5 @@
-ARG BUILD_FROM
+# Runtime base image; the HA builder overrides this per-arch.
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.21
 # Git ref (branch or tag) to build from. Override in CI to pin a release.
 ARG PVIEW_REF=main
 
