@@ -216,7 +216,10 @@ async fn register_diagnostic_entity(
         serde_json::to_string(&config)?,
     );
     reg.update(config.base.availability_topic, "online");
-    reg.update(format!("{MODEL}/sensor/{unique_id}/state"), diagnostic.value);
+    reg.update(
+        format!("{MODEL}/sensor/{unique_id}/state"),
+        diagnostic.value,
+    );
     Ok(())
 }
 
@@ -242,8 +245,12 @@ async fn register_hub(
         DiagnosticEntity {
             name: "Status".to_string(),
             unique_id: format!("{serial}-responding"),
-            value: if state.responding.load(Ordering::SeqCst) { "OK" } else { "UNRESPONSIVE" }
-                .to_string(),
+            value: if state.responding.load(Ordering::SeqCst) {
+                "OK"
+            } else {
+                "UNRESPONSIVE"
+            }
+            .to_string(),
         },
         gateway_data,
         state,
@@ -285,7 +292,11 @@ async fn register_shades(
         };
         // For TDBU shades the primary rail is the bottom and the secondary is the top.
         // Give them explicit names so HA shows "Bottom" and "Top" under one device.
-        let primary_name = if has_secondary { Some("Bottom".to_string()) } else { None };
+        let primary_name = if has_secondary {
+            Some("Bottom".to_string())
+        } else {
+            None
+        };
         let mut shade_ids = vec![(shade.id.to_string(), primary_name, position.pos1_percent())];
 
         if has_secondary {
@@ -317,9 +328,7 @@ async fn register_shades(
                 base: EntityConfig {
                     unique_id,
                     name: shade_name,
-                    availability_topic: format!(
-                        "{MODEL}/shade/{serial}/{shade_id}/availability"
-                    ),
+                    availability_topic: format!("{MODEL}/shade/{serial}/{shade_id}/availability"),
                     device_class: Some("shade".to_string()),
                     origin: Origin::default(),
                     device: device.clone(),
@@ -329,9 +338,7 @@ async fn register_shades(
                 },
                 command_topic: format!("{MODEL}/shade/{serial}/{shade_id}/command"),
                 position_topic: format!("{MODEL}/shade/{serial}/{shade_id}/position"),
-                set_position_topic: format!(
-                    "{MODEL}/shade/{serial}/{shade_id}/set_position"
-                ),
+                set_position_topic: format!("{MODEL}/shade/{serial}/{shade_id}/set_position"),
                 state_topic: format!("{MODEL}/shade/{serial}/{shade_id}/state"),
             };
 
@@ -493,10 +500,7 @@ async fn register_shades(
                 state.discovery_prefix
             ));
             reg.config(
-                format!(
-                    "{}/sensor/{device_id}-psu/config",
-                    state.discovery_prefix
-                ),
+                format!("{}/sensor/{device_id}-psu/config", state.discovery_prefix),
                 serde_json::to_string(&power_source)?,
             );
             reg.update(power_source.base.availability_topic, "online");
@@ -507,16 +511,19 @@ async fn register_shades(
         }
 
         {
-            let velocity_pct = state.velocities.lock().unwrap()
-                .get(&shade.id).copied().unwrap_or(0.0) * 100.0;
+            let velocity_pct = state
+                .velocities
+                .lock()
+                .unwrap()
+                .get(&shade.id)
+                .copied()
+                .unwrap_or(0.0)
+                * 100.0;
             let velocity = NumberConfig {
                 base: EntityConfig {
                     unique_id: format!("{device_id}-velocity"),
                     name: Some("Velocity".to_string()),
-                    availability_topic: format!(
-                        "{MODEL}/shade/{serial}/{}/availability",
-                        shade.id
-                    ),
+                    availability_topic: format!("{MODEL}/shade/{serial}/{}/availability", shade.id),
                     device_class: None,
                     origin: Origin::default(),
                     device: device.clone(),
@@ -722,7 +729,6 @@ async fn advise_hass_of_updated_position(
     Ok(())
 }
 
-
 async fn advise_hass_of_battery_level(
     state: &Arc<Pv2MqttState>,
     shade: &ShadeData,
@@ -803,12 +809,7 @@ impl ServeMqttCommand {
 
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
         client
-            .connect(
-                &mqtt_host,
-                mqtt_port.into(),
-                Duration::from_secs(10),
-                None,
-            )
+            .connect(&mqtt_host, mqtt_port.into(), Duration::from_secs(10), None)
             .await
             .with_context(|| format!("connecting to mqtt broker {mqtt_host}:{mqtt_port}"))?;
         let subscriber = client.subscriber().expect("to own the subscriber");
@@ -820,7 +821,10 @@ impl ServeMqttCommand {
         ) -> anyhow::Result<Arc<MqttRouter<Arc<Pv2MqttState>>>> {
             let mut router: MqttRouter<Arc<Pv2MqttState>> = MqttRouter::new(client.clone());
             router
-                .route(format!("{discovery_prefix}/status"), mqtt_homeassitant_status)
+                .route(
+                    format!("{discovery_prefix}/status"),
+                    mqtt_homeassitant_status,
+                )
                 .await?;
             router
                 .route(
@@ -1019,7 +1023,11 @@ impl ServeMqttCommand {
                     (Some(cur), Some(tgt)) => {
                         let cur_pct = cur.pos1_percent().unwrap_or(0);
                         let tgt_pct = tgt.pos1_percent().unwrap_or(0);
-                        if tgt_pct >= cur_pct { "opening" } else { "closing" }
+                        if tgt_pct >= cur_pct {
+                            "opening"
+                        } else {
+                            "closing"
+                        }
                     }
                     _ => "opening",
                 };
@@ -1276,9 +1284,17 @@ async fn mqtt_shade_set_position(
 
     let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
     let pos = if is_secondary {
-        ShadePosition { secondary: Some(ShadePosition::percent_to_pos(position)), velocity, ..Default::default() }
+        ShadePosition {
+            secondary: Some(ShadePosition::percent_to_pos(position)),
+            velocity,
+            ..Default::default()
+        }
     } else {
-        ShadePosition { primary: Some(ShadePosition::percent_to_pos(position)), velocity, ..Default::default() }
+        ShadePosition {
+            primary: Some(ShadePosition::percent_to_pos(position)),
+            velocity,
+            ..Default::default()
+        }
     };
 
     log::info!(
@@ -1291,7 +1307,11 @@ async fn mqtt_shade_set_position(
     } else {
         format!("{shade_id}")
     };
-    let current = if is_secondary { shade.pos2_percent() } else { shade.pos1_percent() };
+    let current = if is_secondary {
+        shade.pos2_percent()
+    } else {
+        shade.pos1_percent()
+    };
     let motion_state = match current {
         Some(cur) if position > cur => "opening",
         Some(cur) if position < cur => "closing",
@@ -1337,7 +1357,11 @@ async fn mqtt_shade_command(
             hub.hub
                 .set_shade_position(
                     shade_id,
-                    ShadePosition { primary: Some(1.0), velocity, ..Default::default() },
+                    ShadePosition {
+                        primary: Some(1.0),
+                        velocity,
+                        ..Default::default()
+                    },
                 )
                 .await?;
         }
@@ -1347,12 +1371,18 @@ async fn mqtt_shade_command(
             hub.hub
                 .set_shade_position(
                     shade_id,
-                    ShadePosition { primary: Some(0.0), velocity, ..Default::default() },
+                    ShadePosition {
+                        primary: Some(0.0),
+                        velocity,
+                        ..Default::default()
+                    },
                 )
                 .await?;
         }
         "STOP" => {
-            hub.hub.move_shade(shade_id, ShadeUpdateMotion::Stop).await?;
+            hub.hub
+                .move_shade(shade_id, ShadeUpdateMotion::Stop)
+                .await?;
         }
         "JOG" => {
             hub.hub.move_shade(shade_id, ShadeUpdateMotion::Jog).await?;
@@ -1392,8 +1422,12 @@ async fn mqtt_shade_set_velocity(
         Some(value.max(7.0) / 100.0)
     };
     match velocity {
-        Some(v) => { state.velocities.lock().unwrap().insert(shade_id, v); }
-        None => { state.velocities.lock().unwrap().remove(&shade_id); }
+        Some(v) => {
+            state.velocities.lock().unwrap().insert(shade_id, v);
+        }
+        None => {
+            state.velocities.lock().unwrap().remove(&shade_id);
+        }
     }
 
     state

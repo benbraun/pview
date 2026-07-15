@@ -28,10 +28,22 @@ impl ListShadesCommand {
         }
 
         let columns = &[
-            Column { name: "ROOM".to_string(), alignment: Alignment::Left },
-            Column { name: "ID".to_string(), alignment: Alignment::Right },
-            Column { name: "SHADE".to_string(), alignment: Alignment::Left },
-            Column { name: "POSITION".to_string(), alignment: Alignment::Right },
+            Column {
+                name: "ROOM".to_string(),
+                alignment: Alignment::Left,
+            },
+            Column {
+                name: "ID".to_string(),
+                alignment: Alignment::Right,
+            },
+            Column {
+                name: "SHADE".to_string(),
+                alignment: Alignment::Left,
+            },
+            Column {
+                name: "POSITION".to_string(),
+                alignment: Alignment::Right,
+            },
         ];
         let mut rows = vec![];
         for room_data in &rooms {

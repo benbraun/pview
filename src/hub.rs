@@ -93,8 +93,7 @@ impl Hub {
     ///   suggestions if multiple shades share the name
     /// - `"Room Name/Shade Name"` — unambiguous room-qualified lookup
     pub async fn shade_by_name(&self, name: &str) -> anyhow::Result<ShadeData> {
-        let (shades, rooms) =
-            tokio::try_join!(self.list_shades(None), self.list_rooms())?;
+        let (shades, rooms) = tokio::try_join!(self.list_shades(None), self.list_rooms())?;
         let room_name_by_id: std::collections::HashMap<i32, &str> =
             rooms.iter().map(|r| (r.id, r.pt_name.as_str())).collect();
 
@@ -128,9 +127,9 @@ impl Hub {
             if !qualified_matches.is_empty() {
                 return match qualified_matches.len() {
                     1 => Ok(qualified_matches.remove(0)),
-                    _ => anyhow::bail!(
-                        "Multiple shades match '{name}'; use the numeric id instead"
-                    ),
+                    _ => {
+                        anyhow::bail!("Multiple shades match '{name}'; use the numeric id instead")
+                    }
                 };
             }
         }
@@ -166,52 +165,58 @@ impl Hub {
     /// Up/Down/LeftTilt/RightTilt map to `PUT home/shades/{id}/positions`.
     /// Jog maps to `PUT home/shades/{id}/motion {"motion":"jog"}`.
     /// Stop maps to `PUT home/shades/stop?ids={id}` with empty body.
-    pub async fn move_shade(
-        &self,
-        shade_id: i32,
-        motion: ShadeUpdateMotion,
-    ) -> anyhow::Result<()> {
+    pub async fn move_shade(&self, shade_id: i32, motion: ShadeUpdateMotion) -> anyhow::Result<()> {
         match motion {
             ShadeUpdateMotion::Up => {
                 self.set_shade_position(
                     shade_id,
-                    ShadePosition { primary: Some(1.0), ..Default::default() },
+                    ShadePosition {
+                        primary: Some(1.0),
+                        ..Default::default()
+                    },
                 )
                 .await
             }
             ShadeUpdateMotion::Down => {
                 self.set_shade_position(
                     shade_id,
-                    ShadePosition { primary: Some(0.0), ..Default::default() },
+                    ShadePosition {
+                        primary: Some(0.0),
+                        ..Default::default()
+                    },
                 )
                 .await
             }
             ShadeUpdateMotion::LeftTilt => {
                 self.set_shade_position(
                     shade_id,
-                    ShadePosition { tilt: Some(0.0), ..Default::default() },
+                    ShadePosition {
+                        tilt: Some(0.0),
+                        ..Default::default()
+                    },
                 )
                 .await
             }
             ShadeUpdateMotion::RightTilt => {
                 self.set_shade_position(
                     shade_id,
-                    ShadePosition { tilt: Some(1.0), ..Default::default() },
+                    ShadePosition {
+                        tilt: Some(1.0),
+                        ..Default::default()
+                    },
                 )
                 .await
             }
             ShadeUpdateMotion::Jog => {
                 let url = self.url(&format!("home/shades/{shade_id}/motion"));
                 let _: serde_json::Value =
-                    request_with_json_response(Method::PUT, url, &json!({"motion": "jog"}))
-                        .await?;
+                    request_with_json_response(Method::PUT, url, &json!({"motion": "jog"})).await?;
                 Ok(())
             }
             ShadeUpdateMotion::Stop => {
                 let url = self.url(&format!("home/shades/stop?ids={shade_id}"));
                 let _: serde_json::Value =
-                    request_with_json_response(Method::PUT, url, &json!({}))
-                        .await?;
+                    request_with_json_response(Method::PUT, url, &json!({})).await?;
                 Ok(())
             }
         }
@@ -226,8 +231,7 @@ impl Hub {
     ) -> anyhow::Result<()> {
         let url = self.url(&format!("home/shades/{shade_id}/positions"));
         let _: serde_json::Value =
-            request_with_json_response(Method::PUT, url, &json!({ "positions": position }))
-                .await?;
+            request_with_json_response(Method::PUT, url, &json!({ "positions": position })).await?;
         Ok(())
     }
 
@@ -245,8 +249,7 @@ impl Hub {
     }
 
     pub async fn get_gateway_data(&self) -> anyhow::Result<GatewayConfig> {
-        let resp: GatewayResponse =
-            get_request_with_json_response(self.url("gateway")).await?;
+        let resp: GatewayResponse = get_request_with_json_response(self.url("gateway")).await?;
         Ok(resp.config)
     }
 

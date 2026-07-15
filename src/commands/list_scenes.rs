@@ -27,8 +27,14 @@ impl ListScenesCommand {
             .collect();
 
         let columns = &[
-            Column { name: "SCENE".to_string(), alignment: Alignment::Left },
-            Column { name: "ROOMS".to_string(), alignment: Alignment::Left },
+            Column {
+                name: "SCENE".to_string(),
+                alignment: Alignment::Left,
+            },
+            Column {
+                name: "ROOMS".to_string(),
+                alignment: Alignment::Left,
+            },
         ];
         let mut rows = vec![];
         for scene in &scenes {

@@ -111,4 +111,3 @@ pub struct NumberConfig {
     pub step: f64,
     pub mode: String,
 }
-
