@@ -156,25 +156,22 @@ fn setup_logger() {
         // <https://github.com/rust-cli/env_logger/issues/158>
         .format(move |buf, record| {
             use chrono::Utc;
-            use env_logger::fmt::Color;
+            use env_logger::fmt::style::{AnsiColor, Style};
             use std::io::Write;
 
-            let subtle = buf
-                .style()
-                .set_color(Color::Black)
-                .set_intense(true)
-                .clone();
-            write!(buf, "{}", subtle.value("["))?;
+            let subtle = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
+            write!(buf, "{subtle}[{subtle:#}")?;
             write!(
                 buf,
                 "{}{utc_suffix} ",
                 Utc::now().with_timezone(&tz).format("%Y-%m-%dT%H:%M:%S")
             )?;
-            write!(buf, "{:<5}", buf.default_styled_level(record.level()))?;
+            let level_style = buf.default_level_style(record.level());
+            write!(buf, "{level_style}{:<5}{level_style:#}", record.level())?;
             if let Some(path) = record.module_path() {
                 write!(buf, " {}", path)?;
             }
-            write!(buf, "{}", subtle.value("]"))?;
+            write!(buf, "{subtle}]{subtle:#}")?;
             writeln!(buf, " {}", record.args())
         })
         .filter_level(log::LevelFilter::Info)
