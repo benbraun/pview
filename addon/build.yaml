@@ -4,7 +4,9 @@ labels:
   org.opencontainers.image.source: "https://github.com/benbraun/pview"
   org.opencontainers.image.licenses: "MIT"
 
-# Keep in sync with https://github.com/home-assistant/builder/blob/master/build.yaml
+# Runtime base images per architecture. Prebuilt addon images are published
+# by .github/workflows/build.yml; keep the arch list and image versions in
+# sync with the matrix there.
 build_from:
   aarch64: "ghcr.io/home-assistant/aarch64-base:3.21"
   armv7: "ghcr.io/home-assistant/armv7-base:3.21"
@@ -15,7 +17,3 @@ build_from:
 args:
   PVIEW_REPO: "https://github.com/benbraun/pview.git"
   PVIEW_REF: "main"
-
-cosign:
-  identity: https://github.com/benbraun/pview/.*
-  base_identity: https://github.com/home-assistant/docker-base/.*
