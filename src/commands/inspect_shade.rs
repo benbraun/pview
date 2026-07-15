@@ -19,7 +19,11 @@ impl InspectShadeCommand {
         println!("Capabilities:  {:?}", shade.capabilities);
         println!("Power Type:    {:?}", shade.power_type);
         if let Some(bat) = shade.battery_status {
-            println!("Battery:       {:?} ({}%)", bat, shade.battery_percent().unwrap_or(0));
+            println!(
+                "Battery:       {:?} ({}%)",
+                bat,
+                shade.battery_percent().unwrap_or(0)
+            );
         } else {
             println!("Battery:       unavailable");
         }
@@ -32,7 +36,10 @@ impl InspectShadeCommand {
             println!("Signal:        unavailable");
         }
         let fw = &shade.firmware;
-        println!("Firmware:      {}.{}.{}", fw.revision, fw.sub_revision, fw.build);
+        println!(
+            "Firmware:      {}.{}.{}",
+            fw.revision, fw.sub_revision, fw.build
+        );
         println!("Positions:     {}", shade.positions.describe());
         Ok(())
     }

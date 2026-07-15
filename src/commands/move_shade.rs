@@ -37,10 +37,16 @@ impl MoveShadeCommand {
                 ..Default::default()
             };
             hub.set_shade_position(shade.id, pos).await?;
-            println!("Set {} (id={}) primary to {percent}%", shade.pt_name, shade.id);
+            println!(
+                "Set {} (id={}) primary to {percent}%",
+                shade.pt_name, shade.id
+            );
         } else if let Some(percent) = self.target_position.secondary_percent {
             anyhow::ensure!(
-                shade.capabilities.flags().contains(ShadeCapabilityFlags::SECONDARY_RAIL),
+                shade
+                    .capabilities
+                    .flags()
+                    .contains(ShadeCapabilityFlags::SECONDARY_RAIL),
                 "{} (id={}) does not have a secondary rail",
                 shade.pt_name,
                 shade.id
@@ -50,7 +56,10 @@ impl MoveShadeCommand {
                 ..Default::default()
             };
             hub.set_shade_position(shade.id, pos).await?;
-            println!("Set {} (id={}) secondary to {percent}%", shade.pt_name, shade.id);
+            println!(
+                "Set {} (id={}) secondary to {percent}%",
+                shade.pt_name, shade.id
+            );
         } else {
             anyhow::bail!("One of --motion, --percent, or --secondary-percent is required");
         }

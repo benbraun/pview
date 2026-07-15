@@ -11,7 +11,7 @@ use serde_repr::*;
 pub struct RoomData {
     pub id: i32,
     pub pt_name: String,
-    pub name: String,   // raw base64, stored as-is
+    pub name: String, // raw base64, stored as-is
     pub color: String,
     pub icon: String,
     #[serde(rename = "type")]
@@ -25,7 +25,7 @@ pub struct RoomData {
 pub struct Scene {
     pub id: i32,
     pub pt_name: String,
-    pub name: String,   // raw base64, stored as-is
+    pub name: String, // raw base64, stored as-is
     pub color: String,
     pub icon: String,
     pub network_number: i32,
@@ -41,15 +41,15 @@ pub struct ShadeData {
     #[serde(rename = "type")]
     pub shade_type: i32,
     pub pt_name: String,
-    pub name: String,   // raw base64, stored as-is
+    pub name: String, // raw base64, stored as-is
     pub capabilities: ShadeCapabilities,
     pub power_type: PowerType,
     #[serde(default)]
     pub battery_status: Option<BatteryStatus>, // nullable in v3; None = unavailable
-    pub room_id: i32,                          // always present in v3
-    pub firmware: ShadeFirmware,               // always present in v3
-    pub positions: ShadePosition,              // always present in v3
-    pub signal_strength: Option<f64>,          // RSSI in dBm, e.g. -55.0
+    pub room_id: i32,                 // always present in v3
+    pub firmware: ShadeFirmware,      // always present in v3
+    pub positions: ShadePosition,     // always present in v3
+    pub signal_strength: Option<f64>, // RSSI in dBm, e.g. -55.0
     pub ble_name: String,
     pub shade_group_ids: Vec<i32>,
     pub serial_number: String,
