@@ -1,10 +1,15 @@
 name: PowerView to MQTT Bridge
-version: "2026.3.0"
+# version is set to the release tag by scripts/tag-release.sh; it must match
+# a published image tag or Supervisor will fail to pull the addon.
+version: "2026.7.0"
+# Prebuilt images published by .github/workflows/build.yml; Supervisor pulls
+# these instead of compiling on the device.
+image: ghcr.io/benbraun/pview-addon-{arch}
 slug: pv2mqtt
 description: Control Hunter Douglas PowerView Gen 3 shades via Home Assistant MQTT
-url: https://github.com/wez/pview
-documentation: https://github.com/wez/pview/blob/main/README.md
-issue_tracker: https://github.com/wez/pview/issues
+url: https://github.com/benbraun/pview
+documentation: https://github.com/benbraun/pview/blob/main/README.md
+issue_tracker: https://github.com/benbraun/pview/issues
 
 arch:
   - amd64

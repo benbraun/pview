@@ -44,7 +44,7 @@ COPY --from=builder /lib/ld-musl*.so* /lib/libssl*.so* /lib/libcrypto*.so* /usr/
 COPY --from=builder /root/.cargo/bin/pview ./
 
 USER pview:pview
-LABEL org.opencontainers.image.source="https://github.com/wez/pview"
+LABEL org.opencontainers.image.source="https://github.com/benbraun/pview"
 ENV \
   RUST_BACKTRACE=full \
   PATH=/app:$PATH

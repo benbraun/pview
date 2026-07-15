@@ -1,9 +1,11 @@
 services:
   pv2mqtt:
-    image: ghcr.io/wez/pview-no-tls:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.notls
     container_name: pv2mqtt
     restart: unless-stopped
     env_file:
       - .env
-    # Host networking is required
+    # Host networking is required for mDNS hub discovery
     network_mode: host

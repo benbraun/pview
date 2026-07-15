@@ -25,40 +25,57 @@ So why do this?
   across the two separate Python projects that are required for home assistant
   development.
 
-## How do I use this?
+This is a fork of [wez/pview](https://github.com/wez/pview) with additional
+fixes for PowerView Gen 3 hubs.
+
+## Home Assistant OS Add-on
+
+If you run Home Assistant OS (or Supervised), the easiest way to use this is
+as an add-on:
+
+1. Ensure the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/#configuration)
+   is configured (the Mosquitto broker add-on works out of the box).
+2. In Home Assistant, go to **Settings → Add-ons → Add-on Store**, open the
+   menu (⋮) → **Repositories**, and add:
+
+   ```
+   https://github.com/benbraun/pview
+   ```
+
+   [![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbenbraun%2Fpview)
+
+3. Install the **PowerView to MQTT Bridge** add-on and start it. If you use
+   the Mosquitto add-on, MQTT credentials are discovered automatically;
+   otherwise set them in the add-on configuration.
+
+## How do I use this with docker compose?
 
 To run the mqtt bridge:
 
 * Ensure that you have configured the MQTT integration:
   * [follow these steps](https://www.home-assistant.io/integrations/mqtt/#configuration)
 
-* Prepare a `.env` file with your mqtt information:
+* Prepare a `.env` file with your mqtt information
+  (copy [`.env.example`](.env.example) and edit it):
 
-```bash
-# If you want to turn up debugging, uncomment the next line
-#RUST_LOG=pview=debug
-# Always colorize output when running in docker
-RUST_LOG_STYLE=always
-# The hostname or IP address of your mqtt broker
-PV_MQTT_HOST=mqtt.localdomain
-PV_MQTT_PORT=1883
-# If you use authentication, uncomment and fill these out
-#PV_MQTT_USER=username
-#PV_MQTT_PASSWORD=password
+```console
+$ cp .env.example .env
 ```
 
-* Set up your `docker-compose.yml`:
+* Use the provided [`docker-compose.yml`](docker-compose.yml), which builds
+  the image from source:
 
 ```yaml
-version: '3.8'
 services:
   pv2mqtt:
-    image: ghcr.io/wez/pview-no-tls:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.notls
     container_name: pv2mqtt
     restart: unless-stopped
     env_file:
       - .env
-    # Host networking is required
+    # Host networking is required for mDNS hub discovery
     network_mode: host
 ```
 

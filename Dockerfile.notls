@@ -52,7 +52,7 @@ COPY --from=builder /lib/ld-musl*.so* /usr/lib/libgcc*.so* /lib/
 COPY --from=builder /root/.cargo/bin/pview ./
 
 USER pview:pview
-LABEL org.opencontainers.image.source="https://github.com/wez/pview"
+LABEL org.opencontainers.image.source="https://github.com/benbraun/pview"
 ENV \
   RUST_BACKTRACE=full \
   PATH=/app:$PATH
