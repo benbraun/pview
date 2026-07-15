@@ -2,7 +2,7 @@ use crate::version_info::pview_version;
 use serde::Serialize;
 
 const MODEL: &str = "pv2mqtt";
-const URL: &str = "https://github.com/wez/pview";
+const URL: &str = "https://github.com/benbraun/pview";
 
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct EntityConfig {
