@@ -1,7 +1,7 @@
 ####################################################################################################
 ## Builder
 ####################################################################################################
-FROM alpine:latest AS builder
+FROM alpine:3.21 AS builder
 
 RUN apk --no-cache add rustup cargo g++ openssl openssl-dev git
 RUN rustup-init -y
@@ -27,7 +27,7 @@ RUN --mount=type=ssh \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/work/target \
-    cargo install --bin pview --path .
+    cargo install --locked --bin pview --path .
 
 ####################################################################################################
 ## Final image
