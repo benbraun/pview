@@ -4,7 +4,7 @@
 ####################################################################################################
 ## Builder
 ####################################################################################################
-FROM --platform=$BUILDPLATFORM alpine:latest AS builder
+FROM --platform=$BUILDPLATFORM alpine:3.21 AS builder
 ARG TARGETPLATFORM
 RUN case "$TARGETPLATFORM" in \
       "linux/arm/v7") echo armv7-unknown-linux-musleabihf > /rust_target.txt ;; \
@@ -35,7 +35,7 @@ RUN --mount=type=ssh \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/work/target \
-    CC=clang cargo install --target $(cat /rust_target.txt) --bin pview --no-default-features --features mqtt-no-tls --path .
+    CC=clang cargo install --locked --target $(cat /rust_target.txt) --bin pview --no-default-features --features mqtt-no-tls --path .
 
 ####################################################################################################
 ## Final image

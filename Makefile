@@ -11,7 +11,7 @@ addon:
 		--privileged \
 		-v ./addon:/data \
 			ghcr.io/home-assistant/amd64-builder:latest \
-			--all \
+			--amd64 \
 			--test \
 			--target /data
 

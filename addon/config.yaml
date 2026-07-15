@@ -1,13 +1,16 @@
 name: PowerView to MQTT Bridge
-image: ghcr.io/wez/pview-addon-{arch}
-version: "2024.01.11-488ff859"
+version: "2026.3.0"
 slug: pv2mqtt
-description: Control Hunter Douglas Shades via the PowerView Hub
+description: Control Hunter Douglas PowerView Gen 3 shades via Home Assistant MQTT
 url: https://github.com/wez/pview
+documentation: https://github.com/wez/pview/blob/main/README.md
+issue_tracker: https://github.com/wez/pview/issues
+
 arch:
   - amd64
   - aarch64
   - armv7
+
 init: false
 startup: services
 services:
@@ -15,7 +18,7 @@ services:
 
 apparmor: true
 
-# Host network access is required for discovery of the bridge
+# Host network access is required for mDNS hub discovery
 host_network: true
 
 schema:

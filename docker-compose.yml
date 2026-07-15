@@ -1,4 +1,3 @@
-version: '3.8'
 services:
   pv2mqtt:
     image: ghcr.io/wez/pview-no-tls:latest
