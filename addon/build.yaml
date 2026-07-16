@@ -16,4 +16,4 @@ build_from:
 # pins PVIEW_REF to the release tag so the addon builds exactly that code.
 args:
   PVIEW_REPO: "https://github.com/benbraun/pview.git"
-  PVIEW_REF: "2026.07.15-6db1a87e"
+  PVIEW_REF: "2026.07.16-e0496b3d"
