@@ -254,13 +254,24 @@ impl Hub {
     }
 
     /// Opens the SSE shade events stream at `GET home/shades/events?sse=true`.
-    /// Uses a dedicated reqwest client with no timeout (long-lived connection).
+    /// Uses a dedicated reqwest client with no overall timeout (long-lived
+    /// connection); TCP keepalive detects dead peers instead.
     /// SSE events delimited by blank lines; only `data:` lines are parsed.
     /// `Unknown` events are logged at debug level and not yielded.
     pub async fn shade_events_stream(
         &self,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShadeEvent>>> {
-        let client = reqwest::Client::builder().build()?;
+        // No overall timeout: this is a long-lived streaming connection.
+        // TCP keepalive is what detects a half-open connection (hub reboot
+        // or network drop without a FIN): the probes fail and the stream
+        // errors out, letting the caller reconnect. Without it, reading
+        // from a dead peer blocks forever.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .tcp_keepalive_interval(Duration::from_secs(15))
+            .tcp_keepalive_retries(4)
+            .build()?;
         let url = format!("http://{}/home/shades/events?sse=true", self.addr);
         let response = client.get(&url).send().await?;
         let byte_stream = response.bytes_stream();
