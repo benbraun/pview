@@ -85,11 +85,7 @@ pub async fn request_with_json_response<
     url: T,
     body: &B,
 ) -> anyhow::Result<R> {
-    let response = http_client()
-        .request(method, url)
-        .json(body)
-        .send()
-        .await?;
+    let response = http_client().request(method, url).json(body).send().await?;
 
     let status = response.status();
     if !status.is_success() {
