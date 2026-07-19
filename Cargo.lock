@@ -1554,6 +1554,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-channel 2.3.1",
  "async-stream",
  "bitflags 2.13.1",
  "chrono",
