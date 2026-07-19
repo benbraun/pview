@@ -866,10 +866,13 @@ impl ServeMqttCommand {
         // SSE shade event listener — reconnects on stream end or error
         {
             let tx = tx.clone();
-            let hub = state.hub.load().hub.clone();
+            let state = state.clone();
             tokio::spawn(async move {
                 loop {
-                    log::info!("SSE: opening shade events stream");
+                    // Re-resolve on every attempt so that we follow the hub
+                    // when discovery updates its IP address.
+                    let hub = state.hub.load().hub.clone();
+                    log::info!("SSE: opening shade events stream to {}", hub.addr());
                     match hub.shade_events_stream().await {
                         Err(e) => {
                             log::error!("SSE: failed to open stream: {e:#}");
