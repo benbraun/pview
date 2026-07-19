@@ -686,6 +686,17 @@ async fn advise_hass_of_position(
     Ok(())
 }
 
+/// Clamps a hub-supplied ETA to a sane range. The value comes from hub
+/// JSON we don't control; a negative or NaN value would panic
+/// `Duration::from_secs_f64`, and an absurdly large one would leave an
+/// interpolation task running for hours.
+fn sanitize_eta_secs(eta_secs: f64) -> f64 {
+    if eta_secs.is_nan() {
+        return 0.25;
+    }
+    eta_secs.clamp(0.25, 600.0)
+}
+
 /// Spawns a task that publishes interpolated shade position every 250ms
 /// until `eta_secs` elapses. The returned `AbortHandle` cancels it early.
 fn spawn_position_interpolation(
@@ -695,6 +706,7 @@ fn spawn_position_interpolation(
     target: ShadePosition,
     eta_secs: f64,
 ) -> tokio::task::AbortHandle {
+    let eta_secs = sanitize_eta_secs(eta_secs);
     let handle = tokio::spawn(async move {
         let start_time = tokio::time::Instant::now();
         let eta = Duration::from_secs_f64(eta_secs);
@@ -1677,6 +1689,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn sanitize_eta_clamps_hostile_and_degenerate_values() {
+        // Normal values pass through
+        assert_eq!(sanitize_eta_secs(3.5), 3.5);
+        // Values that would panic Duration::from_secs_f64
+        assert_eq!(sanitize_eta_secs(-5.0), 0.25);
+        assert_eq!(sanitize_eta_secs(f64::NAN), 0.25);
+        // Degenerate / absurd values are clamped
+        assert_eq!(sanitize_eta_secs(0.0), 0.25);
+        assert_eq!(sanitize_eta_secs(f64::INFINITY), 600.0);
+        assert_eq!(sanitize_eta_secs(1e12), 600.0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn supervisor_restarts_sessions_with_backoff_and_reset() {
