@@ -9,6 +9,61 @@ use serde_json::json;
 use std::net::IpAddr;
 use std::time::Duration;
 
+/// Ceiling for buffered, not-yet-delimited SSE data. A well-behaved hub
+/// sends small events; hitting this means the peer is streaming garbage,
+/// and we drop the buffer rather than grow without bound.
+const MAX_SSE_BUFFER: usize = 256 * 1024;
+
+/// Incremental parser for an SSE byte stream: push chunks as they arrive,
+/// get back the payload of each complete `data:` line. Buffers bytes (not
+/// text) so that a UTF-8 character split across chunks survives intact.
+struct SseDataParser {
+    buffer: Vec<u8>,
+}
+
+impl SseDataParser {
+    fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+            haystack.windows(needle.len()).position(|w| w == needle)
+        }
+
+        self.buffer.extend_from_slice(chunk);
+        let mut payloads = vec![];
+        loop {
+            // SSE events are separated by blank lines (\r\n\r\n or \n\n);
+            // take whichever delimiter comes first.
+            let crlf = find(&self.buffer, b"\r\n\r\n").map(|pos| (pos, 4));
+            let lf = find(&self.buffer, b"\n\n").map(|pos| (pos, 2));
+            let delim = match (crlf, lf) {
+                (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+                (a, b) => a.or(b),
+            };
+            let Some((pos, delim_len)) = delim else { break };
+            let event_text = String::from_utf8_lossy(&self.buffer[..pos]).into_owned();
+            self.buffer.drain(..pos + delim_len);
+
+            for line in event_text.lines() {
+                let line = line.trim_end_matches('\r');
+                if let Some(data) = line.strip_prefix("data:") {
+                    payloads.push(data.trim().to_string());
+                }
+            }
+        }
+        if self.buffer.len() > MAX_SSE_BUFFER {
+            log::warn!(
+                "SSE: discarding {} bytes of unterminated event data",
+                self.buffer.len()
+            );
+            self.buffer.clear();
+        }
+        payloads
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Hub {
     addr: IpAddr,
@@ -277,39 +332,20 @@ impl Hub {
         let byte_stream = response.bytes_stream();
 
         let stream = try_stream! {
-            let mut buffer = String::new();
+            let mut parser = SseDataParser::new();
             tokio::pin!(byte_stream);
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                loop {
-                    // SSE events are separated by blank lines (\r\n\r\n or \n\n)
-                    let delim = if let Some(pos) = buffer.find("\r\n\r\n") {
-                        Some((pos, 4))
-                    } else if let Some(pos) = buffer.find("\n\n") {
-                        Some((pos, 2))
-                    } else {
-                        None
-                    };
-                    let Some((pos, delim_len)) = delim else { break };
-                    let event_text = buffer[..pos].to_string();
-                    buffer.drain(..pos + delim_len);
-
-                    for line in event_text.lines() {
-                        let line = line.trim_end_matches('\r');
-                        if let Some(json_str) = line.strip_prefix("data:") {
-                            let json_str = json_str.trim();
-                            match serde_json::from_str::<ShadeEvent>(json_str) {
-                                Ok(event) if event.evt != ShadeEventKind::Unknown => {
-                                    yield event;
-                                }
-                                Ok(_) => {
-                                    log::debug!("SSE: unknown event kind in: {json_str}");
-                                }
-                                Err(e) => {
-                                    log::warn!("SSE: failed to parse event: {e:#} — {json_str}");
-                                }
-                            }
+                for json_str in parser.push(&chunk) {
+                    match serde_json::from_str::<ShadeEvent>(&json_str) {
+                        Ok(event) if event.evt != ShadeEventKind::Unknown => {
+                            yield event;
+                        }
+                        Ok(_) => {
+                            log::debug!("SSE: unknown event kind in: {json_str}");
+                        }
+                        Err(e) => {
+                            log::warn!("SSE: failed to parse event: {e:#} — {json_str}");
                         }
                     }
                 }
@@ -317,5 +353,50 @@ impl Hub {
         };
 
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_parser_yields_data_and_preserves_utf8_split_across_chunks() {
+        let mut parser = SseDataParser::new();
+        // "café" with the 2-byte é (0xC3 0xA9) split across chunks
+        assert_eq!(parser.push(b"data: {\"name\":\"caf"), Vec::<String>::new());
+        assert_eq!(parser.push(&[0xC3]), Vec::<String>::new());
+        assert_eq!(
+            parser.push(&[0xA9, b'"', b'}', b'\n', b'\n']),
+            vec![r#"{"name":"café"}"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn sse_parser_handles_crlf_delimiters_and_multiple_events() {
+        let mut parser = SseDataParser::new();
+        let payloads = parser.push(b"data: one\r\n\r\ndata: two\n\ndata: partial");
+        assert_eq!(payloads, vec!["one".to_string(), "two".to_string()]);
+        // the partial event completes on a later push
+        assert_eq!(parser.push(b"\n\n"), vec!["partial".to_string()]);
+    }
+
+    #[test]
+    fn sse_parser_bounds_buffer_growth() {
+        let mut parser = SseDataParser::new();
+        // A hostile/broken peer streams data with no event delimiter
+        for _ in 0..600 {
+            let payloads = parser.push(&[b'x'; 1024]);
+            assert_eq!(payloads, Vec::<String>::new());
+            assert!(
+                parser.buffer.len() <= MAX_SSE_BUFFER,
+                "buffer grew to {} bytes",
+                parser.buffer.len()
+            );
+        }
+        // The next delimiter terminates the garbage "event" (which yields
+        // nothing), and parsing resyncs: a well-formed event parses again.
+        assert_eq!(parser.push(b"\n\n"), Vec::<String>::new());
+        assert_eq!(parser.push(b"data: ok\n\n"), vec!["ok".to_string()]);
     }
 }
