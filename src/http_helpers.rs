@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::sync::OnceLock;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -6,6 +7,21 @@ use thiserror::Error;
 #[error("Hub is Locked for maintenance. Response: {body}")]
 pub struct LockedError {
     pub body: String,
+}
+
+/// Shared client for hub REST calls, so connections are pooled.
+/// The connect timeout is short so that an unreachable hub surfaces as a
+/// connect error quickly (serve-mqtt's unresponsive-hub detection keys off
+/// `is_connect()`) instead of stalling callers for the full request timeout.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to construct reqwest client")
+    })
 }
 
 pub async fn json_body<T: serde::de::DeserializeOwned>(
@@ -23,9 +39,7 @@ pub async fn json_body<T: serde::de::DeserializeOwned>(
 pub async fn get_request_with_json_response<T: reqwest::IntoUrl, R: serde::de::DeserializeOwned>(
     url: T,
 ) -> anyhow::Result<R> {
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?
+    let response = http_client()
         .request(reqwest::Method::GET, url)
         .send()
         .await?;
@@ -71,9 +85,7 @@ pub async fn request_with_json_response<
     url: T,
     body: &B,
 ) -> anyhow::Result<R> {
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?
+    let response = http_client()
         .request(method, url)
         .json(body)
         .send()
