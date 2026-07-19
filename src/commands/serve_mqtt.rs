@@ -839,27 +839,41 @@ impl ServeMqttCommand {
             });
         }
 
-        // Hub discovery task
+        // Hub discovery task: watches mDNS so we can follow the hub if its
+        // IP changes. Supervised so that a dying mDNS channel restarts
+        // discovery instead of silently disabling IP-change tracking.
         if !args.hub_ip_was_specified_by_user() {
             let tx = tx.clone();
             let serial_filter = args.hub_serial()?;
-            let mut disco = crate::discovery::resolve_hubs(None).await?;
             tokio::spawn(async move {
-                while let Some(resolved_hub) = disco.recv().await {
-                    log::trace!("disco resolved: {resolved_hub:?}");
-                    if let Some(gateway_data) = &resolved_hub.gateway_data {
-                        if let Some(serial) = &serial_filter {
-                            if *serial != gateway_data.serial_number {
-                                continue;
+                supervise_sessions(
+                    "mdns discovery",
+                    RECONNECT_BASE_DELAY,
+                    RECONNECT_MAX_DELAY,
+                    Duration::from_secs(60),
+                    move || {
+                        let tx = tx.clone();
+                        let serial_filter = serial_filter.clone();
+                        async move {
+                            let mut disco = crate::discovery::resolve_hubs(None).await?;
+                            while let Some(resolved_hub) = disco.recv().await {
+                                log::trace!("disco resolved: {resolved_hub:?}");
+                                if let Some(gateway_data) = &resolved_hub.gateway_data {
+                                    if let Some(serial) = &serial_filter {
+                                        if *serial != gateway_data.serial_number {
+                                            continue;
+                                        }
+                                    }
+                                    tx.send(ServerEvent::HubDiscovered(resolved_hub))
+                                        .await
+                                        .context("serve loop is gone")?;
+                                }
                             }
+                            anyhow::bail!("mdns discovery channel closed");
                         }
-                        if let Err(err) = tx.send(ServerEvent::HubDiscovered(resolved_hub)).await {
-                            log::error!("discovery: send to main thread: {err:#}");
-                            break;
-                        }
-                    }
-                }
-                log::warn!("fell out of disco loop");
+                    },
+                )
+                .await;
             });
         }
 
