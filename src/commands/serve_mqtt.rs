@@ -143,6 +143,7 @@ impl HassRegistration {
                     RegEntry::Msg { topic, payload } => {
                         state
                             .client
+                            .load()
                             .publish(&topic, payload.as_bytes(), QoS::AtMostOnce, false)
                             .await?;
                     }
@@ -631,6 +632,7 @@ async fn advise_hass_of_unresponsive(state: &Arc<Pv2MqttState>) -> anyhow::Resul
     state.responding.store(false, Ordering::SeqCst);
     state
         .client
+        .load()
         .publish(
             format!("{MODEL}/sensor/{}-responding/state", state.serial),
             "UNRESPONSIVE",
@@ -648,6 +650,7 @@ async fn advise_hass_of_state_label(
 ) -> anyhow::Result<()> {
     state
         .client
+        .load()
         .publish(
             &format!(
                 "{MODEL}/shade/{serial}/{shade_id}/state",
@@ -668,6 +671,7 @@ async fn advise_hass_of_position(
 ) -> anyhow::Result<()> {
     state
         .client
+        .load()
         .publish(
             &format!(
                 "{MODEL}/shade/{serial}/{shade_id}/position",
@@ -739,15 +743,18 @@ async fn advise_hass_of_battery_level(
     if let Some(pct) = shade.battery_percent() {
         state
             .client
+            .load()
             .publish(state_topic, format!("{pct}"), QoS::AtMostOnce, false)
             .await?;
         state
             .client
+            .load()
             .publish(availability_topic, "online", QoS::AtMostOnce, false)
             .await?;
     } else {
         state
             .client
+            .load()
             .publish(availability_topic, "offline", QoS::AtMostOnce, false)
             .await?;
     }
@@ -798,7 +805,7 @@ impl ServeMqttCommand {
                 hub: resolved.hub.clone(),
                 gateway_data,
             })),
-            client: client.clone(),
+            client: ArcSwap::new(Arc::new(client.clone())),
             serial: serial.clone(),
             discovery_prefix: self.discovery_prefix.clone(),
             first_run: AtomicBool::new(true),
@@ -808,54 +815,15 @@ impl ServeMqttCommand {
         });
 
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
+        client.set_reconnect_delay(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY, true)?;
         client
             .connect(&mqtt_host, mqtt_port.into(), Duration::from_secs(10), None)
             .await
             .with_context(|| format!("connecting to mqtt broker {mqtt_host}:{mqtt_port}"))?;
         let subscriber = client.subscriber().expect("to own the subscriber");
 
-        async fn rebuild_router(
-            client: &Client,
-            state: &Arc<Pv2MqttState>,
-            discovery_prefix: &str,
-        ) -> anyhow::Result<Arc<MqttRouter<Arc<Pv2MqttState>>>> {
-            let mut router: MqttRouter<Arc<Pv2MqttState>> = MqttRouter::new(client.clone());
-            router
-                .route(
-                    format!("{discovery_prefix}/status"),
-                    mqtt_homeassitant_status,
-                )
-                .await?;
-            router
-                .route(
-                    format!("{MODEL}/scene/:serial/:scene_id/set"),
-                    mqtt_scene_activate,
-                )
-                .await?;
-            router
-                .route(
-                    format!("{MODEL}/shade/:serial/:shade_id/set_position"),
-                    mqtt_shade_set_position,
-                )
-                .await?;
-            router
-                .route(
-                    format!("{MODEL}/shade/:serial/:shade_id/command"),
-                    mqtt_shade_command,
-                )
-                .await?;
-            router
-                .route(
-                    format!("{MODEL}/shade/:serial/:shade_id/velocity/set"),
-                    mqtt_shade_set_velocity,
-                )
-                .await?;
-            register_with_hass(state).await?;
-            Ok(Arc::new(router))
-        }
-
-        let mut router = rebuild_router(&client, &state, &self.discovery_prefix).await?;
-        let mut need_rebuild = false;
+        let router = build_router(&client, &self.discovery_prefix).await?;
+        register_with_hass(&state).await?;
 
         // Periodic state update timer
         {
@@ -932,45 +900,45 @@ impl ServeMqttCommand {
             });
         }
 
-        // MQTT event loop
+        // Supervised MQTT event loop. Any way the session can die — the
+        // client permanently disconnecting, the subscriber channel closing,
+        // or a failed resubscribe after reconnect — tears down the session;
+        // the supervisor then builds a fresh client and carries on.
         {
             let state = state.clone();
             let discovery_prefix = self.discovery_prefix.to_string();
+            let initial = std::sync::Mutex::new(Some((client, subscriber, router)));
+            let session_params = MqttSessionParams {
+                mqtt_host,
+                mqtt_port,
+                mqtt_username,
+                mqtt_password,
+            };
             tokio::spawn(async move {
-                while let Ok(event) = subscriber.recv().await {
-                    match event {
-                        Event::Message(msg) => {
-                            if let Err(err) = tx
-                                .send(ServerEvent::MqttMessage {
-                                    msg,
-                                    router: router.clone(),
-                                })
-                                .await
-                            {
-                                log::error!("{err:#?}");
-                                break;
-                            }
-                        }
-                        Event::Disconnected(reason) => {
-                            log::warn!("MQTT disconnected: {reason}");
-                            need_rebuild = true;
-                        }
-                        Event::Connected(status) => {
-                            log::info!("MQTT (re)connected {status}");
-                            if need_rebuild {
-                                match rebuild_router(&client, &state, &discovery_prefix).await {
-                                    Err(err) => {
-                                        log::error!("Rebuilding router: {err:#}");
-                                        break;
-                                    }
-                                    Ok(r) => {
-                                        router = r;
-                                    }
+                supervise_sessions(
+                    "mqtt",
+                    RECONNECT_BASE_DELAY,
+                    RECONNECT_MAX_DELAY,
+                    Duration::from_secs(60),
+                    move || {
+                        let state = state.clone();
+                        let tx = tx.clone();
+                        let discovery_prefix = discovery_prefix.clone();
+                        let params = session_params.clone();
+                        let initial = initial.lock().unwrap().take();
+                        async move {
+                            let (client, subscriber, router) = match initial {
+                                Some(session) => session,
+                                None => {
+                                    connect_mqtt_session(&params, &state, &tx, &discovery_prefix)
+                                        .await?
                                 }
-                            }
+                            };
+                            mqtt_event_pump(client, subscriber, router, tx, discovery_prefix).await
                         }
-                    }
-                }
+                    },
+                )
+                .await;
             });
         }
 
@@ -1056,6 +1024,7 @@ impl ServeMqttCommand {
             ShadeEventKind::ShadeOffline => {
                 state
                     .client
+                    .load()
                     .publish(
                         format!(
                             "{MODEL}/shade/{serial}/{}/availability",
@@ -1070,6 +1039,7 @@ impl ServeMqttCommand {
                 // Also mark secondary rail offline if present
                 state
                     .client
+                    .load()
                     .publish(
                         format!(
                             "{MODEL}/shade/{serial}/{}{SECONDARY_SUFFIX}/availability",
@@ -1087,6 +1057,7 @@ impl ServeMqttCommand {
                     Ok(shade) => {
                         state
                             .client
+                            .load()
                             .publish(
                                 format!(
                                     "{MODEL}/shade/{serial}/{}/availability",
@@ -1448,6 +1419,7 @@ async fn mqtt_shade_set_velocity(
 
     state
         .client
+        .load()
         .publish(
             &format!(
                 "{MODEL}/shade/{serial}/{shade_id}/velocity/state",
@@ -1480,7 +1452,9 @@ struct FullyResolvedHub {
 
 struct Pv2MqttState {
     hub: ArcSwap<FullyResolvedHub>,
-    client: Client,
+    /// Swapped out for a fresh client when an MQTT session dies
+    /// and gets rebuilt by the session supervisor.
+    client: ArcSwap<Client>,
     serial: String,
     discovery_prefix: String,
     first_run: AtomicBool,
@@ -1504,5 +1478,241 @@ impl Pv2MqttState {
 
     pub fn power_type_state_topic(&self, shade: &ShadeData) -> String {
         format!("{MODEL}/sensor/{}/{}/psu/state", self.serial, shade.id)
+    }
+}
+
+const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+const MQTT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct MqttSessionParams {
+    mqtt_host: String,
+    mqtt_port: u16,
+    mqtt_username: Option<String>,
+    mqtt_password: Option<String>,
+}
+
+/// Subscribes to the topics we serve and returns the router for them.
+/// Deliberately does not talk to the hub: a slow or unresponsive hub
+/// must not be able to fail MQTT (re)connection.
+async fn build_router(
+    client: &Client,
+    discovery_prefix: &str,
+) -> anyhow::Result<Arc<MqttRouter<Arc<Pv2MqttState>>>> {
+    let mut router: MqttRouter<Arc<Pv2MqttState>> = MqttRouter::new(client.clone());
+    router
+        .route(
+            format!("{discovery_prefix}/status"),
+            mqtt_homeassitant_status,
+        )
+        .await?;
+    router
+        .route(
+            format!("{MODEL}/scene/:serial/:scene_id/set"),
+            mqtt_scene_activate,
+        )
+        .await?;
+    router
+        .route(
+            format!("{MODEL}/shade/:serial/:shade_id/set_position"),
+            mqtt_shade_set_position,
+        )
+        .await?;
+    router
+        .route(
+            format!("{MODEL}/shade/:serial/:shade_id/command"),
+            mqtt_shade_command,
+        )
+        .await?;
+    router
+        .route(
+            format!("{MODEL}/shade/:serial/:shade_id/velocity/set"),
+            mqtt_shade_set_velocity,
+        )
+        .await?;
+    Ok(Arc::new(router))
+}
+
+/// Builds a fresh MQTT client, connects it, subscribes our routes, and
+/// publishes the new client into `state` so that all publishers use it.
+async fn connect_mqtt_session(
+    params: &MqttSessionParams,
+    state: &Arc<Pv2MqttState>,
+    tx: &tokio::sync::mpsc::Sender<ServerEvent>,
+    discovery_prefix: &str,
+) -> anyhow::Result<(
+    Client,
+    async_channel::Receiver<Event>,
+    Arc<MqttRouter<Arc<Pv2MqttState>>>,
+)> {
+    let client = Client::with_auto_id()?;
+    client.set_username_and_password(
+        params.mqtt_username.as_deref(),
+        params.mqtt_password.as_deref(),
+    )?;
+    client.set_reconnect_delay(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY, true)?;
+    tokio::time::timeout(
+        MQTT_CONNECT_TIMEOUT,
+        client.connect(
+            &params.mqtt_host,
+            params.mqtt_port.into(),
+            Duration::from_secs(10),
+            None,
+        ),
+    )
+    .await
+    .context("timed out connecting to mqtt broker")?
+    .with_context(|| {
+        format!(
+            "connecting to mqtt broker {}:{}",
+            params.mqtt_host, params.mqtt_port
+        )
+    })?;
+    let subscriber = client
+        .subscriber()
+        .ok_or_else(|| anyhow::anyhow!("subscriber channel unavailable on new client"))?;
+    let router = build_router(&client, discovery_prefix).await?;
+    state.client.store(Arc::new(client.clone()));
+    // Ask the serve loop to re-register everything with hass; that path
+    // tolerates (and reports) an unresponsive hub instead of failing us.
+    tx.send(ServerEvent::PeriodicStateUpdate).await.ok();
+    Ok((client, subscriber, router))
+}
+
+/// Forwards MQTT events to the serve loop until the session dies.
+/// Transient disconnects are handled by libmosquitto's auto-reconnect;
+/// we resubscribe when the connection comes back. Returns an error when
+/// the session is beyond repair and must be rebuilt from a new client.
+async fn mqtt_event_pump(
+    client: Client,
+    subscriber: async_channel::Receiver<Event>,
+    mut router: Arc<MqttRouter<Arc<Pv2MqttState>>>,
+    tx: tokio::sync::mpsc::Sender<ServerEvent>,
+    discovery_prefix: String,
+) -> anyhow::Result<()> {
+    let mut need_rebuild = false;
+    loop {
+        let event = subscriber
+            .recv()
+            .await
+            .map_err(|_| anyhow::anyhow!("mqtt client closed the event channel"))?;
+        match event {
+            Event::Message(msg) => {
+                tx.send(ServerEvent::MqttMessage {
+                    msg,
+                    router: router.clone(),
+                })
+                .await
+                .context("serve loop is gone")?;
+            }
+            Event::Disconnected(reason) => {
+                log::warn!("MQTT disconnected: {reason}; waiting for reconnect");
+                need_rebuild = true;
+            }
+            Event::Connected(status) => {
+                log::info!("MQTT (re)connected {status}");
+                if need_rebuild {
+                    router = build_router(&client, &discovery_prefix)
+                        .await
+                        .context("resubscribing after mqtt reconnect")?;
+                    need_rebuild = false;
+                    // Re-register with hass via the fault-tolerant serve loop path
+                    tx.send(ServerEvent::PeriodicStateUpdate).await.ok();
+                }
+            }
+        }
+    }
+}
+
+/// Runs `make_session` forever, restarting it whenever it ends.
+/// Restarts are delayed with exponential backoff between `base_delay` and
+/// `max_delay`; a session that survives at least `healthy_after` resets
+/// the backoff to `base_delay`.
+async fn supervise_sessions<F, Fut>(
+    name: &str,
+    base_delay: Duration,
+    max_delay: Duration,
+    healthy_after: Duration,
+    mut make_session: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut delay = base_delay;
+    loop {
+        let started = tokio::time::Instant::now();
+        match make_session().await {
+            Ok(()) => log::warn!("{name}: session ended unexpectedly"),
+            Err(err) => log::error!("{name}: session failed: {err:#}"),
+        }
+        if started.elapsed() >= healthy_after {
+            delay = base_delay;
+        }
+        log::info!("{name}: restarting session in {delay:?}");
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(max_delay);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex as StdMutex;
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_restarts_sessions_with_backoff_and_reset() {
+        const BASE: Duration = Duration::from_secs(1);
+        const MAX: Duration = Duration::from_secs(8);
+        const HEALTHY: Duration = Duration::from_secs(30);
+
+        let starts: Arc<StdMutex<Vec<tokio::time::Instant>>> = Arc::new(StdMutex::new(Vec::new()));
+        let attempt = Arc::new(AtomicUsize::new(0));
+
+        {
+            let starts = starts.clone();
+            tokio::spawn(supervise_sessions("test", BASE, MAX, HEALTHY, move || {
+                let starts = starts.clone();
+                let attempt = attempt.clone();
+                async move {
+                    starts.lock().unwrap().push(tokio::time::Instant::now());
+                    match attempt.fetch_add(1, Ordering::SeqCst) {
+                        0..=2 => anyhow::bail!("session died immediately"),
+                        3 => {
+                            // Healthy session: outlives HEALTHY, then dies
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            anyhow::bail!("session died after healthy run")
+                        }
+                        _ => {
+                            // Park forever so the timeline ends here
+                            std::future::pending::<()>().await;
+                            Ok(())
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Paused-time runtime: this fast-forwards through the whole timeline
+        tokio::time::sleep(Duration::from_secs(120)).await;
+
+        let starts = starts.lock().unwrap();
+        assert_eq!(starts.len(), 5, "expected 5 session attempts");
+        let gaps: Vec<Duration> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(
+            gaps[0],
+            Duration::from_secs(1),
+            "first restart after base delay"
+        );
+        assert_eq!(gaps[1], Duration::from_secs(2), "backoff doubles");
+        assert_eq!(gaps[2], Duration::from_secs(4), "backoff doubles again");
+        // Session 4 ran for 60s (> HEALTHY) so the backoff resets to base:
+        // 60s session + 1s base delay
+        assert_eq!(
+            gaps[3],
+            Duration::from_secs(61),
+            "healthy session resets backoff"
+        );
     }
 }
