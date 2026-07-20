@@ -697,7 +697,14 @@ fn sanitize_eta_secs(eta_secs: f64) -> f64 {
     eta_secs.clamp(0.25, 600.0)
 }
 
-/// Spawns a task that publishes interpolated shade position every 250ms
+/// Linear interpolation between two shade percentages; `t` is clamped
+/// to 0..=1 so callers can pass elapsed/eta ratios directly.
+fn interpolate_pct(start: u8, target: u8, t: f64) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    (start as f64 + (target as f64 - start as f64) * t).round() as u8
+}
+
+/// Spawns a task that publishes interpolated shade position on each tick
 /// until `eta_secs` elapses. The returned `AbortHandle` cancels it early.
 fn spawn_position_interpolation(
     state: Arc<Pv2MqttState>,
@@ -712,17 +719,27 @@ fn spawn_position_interpolation(
         let eta = Duration::from_secs_f64(eta_secs);
         let shade_id_str = format!("{shade_id}");
         let sec_id = format!("{shade_id}{SECONDARY_SUFFIX}");
+        // Publish only when the integer percent changes, so the faster
+        // tick doesn't multiply MQTT/HA traffic.
+        let mut last_primary = None;
+        let mut last_secondary = None;
         loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(INTERPOLATION_TICK).await;
             let elapsed = start_time.elapsed();
-            let t = (elapsed.as_secs_f64() / eta_secs).min(1.0);
+            let t = elapsed.as_secs_f64() / eta_secs;
             if let (Some(s), Some(tgt)) = (start.pos1_percent(), target.pos1_percent()) {
-                let pct = (s as f64 + (tgt as f64 - s as f64) * t).round() as u8;
-                let _ = advise_hass_of_position(&state, &shade_id_str, pct).await;
+                let pct = interpolate_pct(s, tgt, t);
+                if last_primary != Some(pct) {
+                    let _ = advise_hass_of_position(&state, &shade_id_str, pct).await;
+                    last_primary = Some(pct);
+                }
             }
             if let (Some(s), Some(tgt)) = (start.pos2_percent(), target.pos2_percent()) {
-                let pct = (s as f64 + (tgt as f64 - s as f64) * t).round() as u8;
-                let _ = advise_hass_of_position(&state, &sec_id, pct).await;
+                let pct = interpolate_pct(s, tgt, t);
+                if last_secondary != Some(pct) {
+                    let _ = advise_hass_of_position(&state, &sec_id, pct).await;
+                    last_secondary = Some(pct);
+                }
             }
             if elapsed >= eta {
                 break;
@@ -1513,6 +1530,10 @@ impl Pv2MqttState {
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const MQTT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a moving shade's interpolated position is recomputed.
+/// 100ms captures nearly every integer percent step of typical shade
+/// travel, which is as smooth as HA's integer position model allows.
+const INTERPOLATION_TICK: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 struct MqttSessionParams {
@@ -1689,6 +1710,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn interpolate_pct_covers_endpoints_midpoints_and_clamping() {
+        // Endpoints
+        assert_eq!(interpolate_pct(0, 100, 0.0), 0);
+        assert_eq!(interpolate_pct(0, 100, 1.0), 100);
+        // Midpoint, both directions
+        assert_eq!(interpolate_pct(0, 100, 0.5), 50);
+        assert_eq!(interpolate_pct(80, 20, 0.5), 50);
+        // t beyond the range clamps to the endpoints
+        assert_eq!(interpolate_pct(10, 90, 1.5), 90);
+        assert_eq!(interpolate_pct(10, 90, -0.5), 10);
+        // No movement stays put
+        assert_eq!(interpolate_pct(42, 42, 0.7), 42);
+    }
 
     #[test]
     fn sanitize_eta_clamps_hostile_and_degenerate_values() {
