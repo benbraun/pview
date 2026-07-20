@@ -1,7 +1,7 @@
 name: PowerView to MQTT Bridge
 # version is set to the release tag by scripts/tag-release.sh; it must match
 # a published image tag or Supervisor will fail to pull the addon.
-version: "2026.07.20-8230c109"
+version: "2026.07.20-67d04c9c"
 # Prebuilt images published by .github/workflows/build.yml; Supervisor pulls
 # these instead of compiling on the device.
 image: ghcr.io/benbraun/pview-addon-{arch}
