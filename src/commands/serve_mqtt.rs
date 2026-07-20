@@ -682,6 +682,11 @@ async fn advise_hass_of_position(
             false,
         )
         .await?;
+    state
+        .last_published_pos
+        .lock()
+        .unwrap()
+        .insert(shade_id.to_string(), position);
 
     Ok(())
 }
@@ -841,6 +846,7 @@ impl ServeMqttCommand {
             responding: AtomicBool::new(true),
             motion_tasks: std::sync::Mutex::new(HashMap::new()),
             velocities: std::sync::Mutex::new(HashMap::new()),
+            last_published_pos: std::sync::Mutex::new(HashMap::new()),
         });
 
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
@@ -1012,9 +1018,7 @@ impl ServeMqttCommand {
         match event.evt {
             ShadeEventKind::MotionStopped => {
                 // Cancel any in-progress interpolation for this shade
-                if let Some(handle) = state.motion_tasks.lock().unwrap().remove(&event.id) {
-                    handle.abort();
-                }
+                state.cancel_motion(event.id);
                 if let Some(positions) = &event.current_positions {
                     let shade_id_str = format!("{}", event.id);
                     if let Some(pct) = positions.pos1_percent() {
@@ -1047,9 +1051,7 @@ impl ServeMqttCommand {
                 };
                 advise_hass_of_state_label(state, &shade_id_str, motion_state).await?;
                 // Cancel any previous interpolation task for this shade
-                if let Some(handle) = state.motion_tasks.lock().unwrap().remove(&event.id) {
-                    handle.abort();
-                }
+                state.cancel_motion(event.id);
                 // Spawn position interpolation if we have enough data
                 if let (Some(current), Some(target)) =
                     (event.current_positions, event.target_positions)
@@ -1273,6 +1275,34 @@ struct SerialAndShade {
     #[serde(deserialize_with = "parse_deser")]
     shade_id: ShadeIdAddr,
 }
+/// What to do about an incoming position command.
+#[derive(Debug, PartialEq)]
+enum PositionCommandPlan {
+    /// The shade is already parked there; don't bother the hub.
+    Skip,
+    /// Send it, optionally publishing a motion state label first.
+    Send(Option<&'static str>),
+}
+
+/// Decides how to react to a position command.
+///
+/// `current` is our best estimate of where the rail is now. The
+/// skip-if-already-there optimisation only applies at rest: mid-motion the
+/// shade is travelling *away* from `current`, so dropping the command would
+/// strand it heading for the previous target.
+fn plan_position_command(target: u8, current: Option<u8>, in_motion: bool) -> PositionCommandPlan {
+    match current {
+        Some(cur) if target > cur => PositionCommandPlan::Send(Some("opening")),
+        Some(cur) if target < cur => PositionCommandPlan::Send(Some("closing")),
+        Some(_) if !in_motion => PositionCommandPlan::Skip,
+        // Moving, and commanded to roughly where it is right now: it will
+        // stop here. Don't guess a direction; the imminent motion event
+        // resolves the state.
+        Some(_) => PositionCommandPlan::Send(None),
+        None => PositionCommandPlan::Send(Some("opening")),
+    }
+}
+
 async fn mqtt_shade_set_position(
     params: Params<SerialAndShade>,
     Topic(topic): Topic,
@@ -1324,23 +1354,28 @@ async fn mqtt_shade_set_position(
     } else {
         format!("{shade_id}")
     };
-    let current = if is_secondary {
+    let hub_pct = if is_secondary {
         shade.pos2_percent()
     } else {
         shade.pos1_percent()
     };
-    let motion_state = match current {
-        Some(cur) if position > cur => "opening",
-        Some(cur) if position < cur => "closing",
-        Some(cur) => {
+    let (in_motion, current) = current_estimate(&state, shade_id, &shade_id_str, hub_pct);
+    match plan_position_command(position, current, in_motion) {
+        PositionCommandPlan::Skip => {
             log::info!(
-                "Shade {shade_id} already at {cur}%, skipping duplicate set-position command"
+                "Shade {shade_id} already at {position}%, skipping duplicate set-position command"
             );
             return Ok(());
         }
-        None => "opening", // unknown current position; assume opening
-    };
-    advise_hass_of_state_label(&state, &shade_id_str, motion_state).await?;
+        PositionCommandPlan::Send(label) => {
+            // This command supersedes whatever target an interpolation was
+            // driving toward, so stop animating to the stale one.
+            state.cancel_motion(shade_id);
+            if let Some(label) = label {
+                advise_hass_of_state_label(&state, &shade_id_str, label).await?;
+            }
+        }
+    }
     hub.hub.set_shade_position(shade_id, pos).await?;
     Ok(())
 }
@@ -1375,12 +1410,20 @@ async fn mqtt_shade_command(
     let shade_id_str = format!("{shade_id}");
     match command.as_ref() {
         "OPEN" => {
-            let cur = shade.pos1_percent();
-            if cur == Some(100) {
-                log::info!("Shade {shade_id} already open, skipping duplicate OPEN command");
-                return Ok(());
+            let (in_motion, current) =
+                current_estimate(&state, shade_id, &shade_id_str, shade.pos1_percent());
+            match plan_position_command(100, current, in_motion) {
+                PositionCommandPlan::Skip => {
+                    log::info!("Shade {shade_id} already open, skipping duplicate OPEN command");
+                    return Ok(());
+                }
+                PositionCommandPlan::Send(label) => {
+                    state.cancel_motion(shade_id);
+                    if let Some(label) = label {
+                        advise_hass_of_state_label(&state, &shade_id_str, label).await?;
+                    }
+                }
             }
-            advise_hass_of_state_label(&state, &shade_id_str, "opening").await?;
             let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
             hub.hub
                 .set_shade_position(
@@ -1394,12 +1437,20 @@ async fn mqtt_shade_command(
                 .await?;
         }
         "CLOSE" => {
-            let cur = shade.pos1_percent();
-            if cur == Some(0) {
-                log::info!("Shade {shade_id} already closed, skipping duplicate CLOSE command");
-                return Ok(());
+            let (in_motion, current) =
+                current_estimate(&state, shade_id, &shade_id_str, shade.pos1_percent());
+            match plan_position_command(0, current, in_motion) {
+                PositionCommandPlan::Skip => {
+                    log::info!("Shade {shade_id} already closed, skipping duplicate CLOSE command");
+                    return Ok(());
+                }
+                PositionCommandPlan::Send(label) => {
+                    state.cancel_motion(shade_id);
+                    if let Some(label) = label {
+                        advise_hass_of_state_label(&state, &shade_id_str, label).await?;
+                    }
+                }
             }
-            advise_hass_of_state_label(&state, &shade_id_str, "closing").await?;
             let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
             hub.hub
                 .set_shade_position(
@@ -1413,6 +1464,9 @@ async fn mqtt_shade_command(
                 .await?;
         }
         "STOP" => {
+            // The shade halts wherever it is, so any interpolation toward
+            // the old target is now wrong. MotionStopped reports the truth.
+            state.cancel_motion(shade_id);
             hub.hub
                 .move_shade(shade_id, ShadeUpdateMotion::Stop)
                 .await?;
@@ -1508,6 +1562,11 @@ struct Pv2MqttState {
     motion_tasks: std::sync::Mutex<HashMap<i32, tokio::task::AbortHandle>>,
     /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
     velocities: std::sync::Mutex<HashMap<i32, f64>>,
+    /// Last percent published per rail (keyed like the mqtt topic id, so
+    /// `"5"` and `"5_top"` are tracked separately). While a shade is moving
+    /// this is a better estimate of where it is than the hub's REST value,
+    /// which reports the pre-motion position until the shade settles.
+    last_published_pos: std::sync::Mutex<HashMap<String, u8>>,
 }
 
 impl Pv2MqttState {
@@ -1525,6 +1584,46 @@ impl Pv2MqttState {
     pub fn power_type_state_topic(&self, shade: &ShadeData) -> String {
         format!("{MODEL}/sensor/{}/{}/psu/state", self.serial, shade.id)
     }
+
+    /// True while an interpolation task is driving this shade, i.e. we
+    /// believe it is physically moving.
+    fn is_in_motion(&self, shade_id: i32) -> bool {
+        self.motion_tasks.lock().unwrap().contains_key(&shade_id)
+    }
+
+    /// Stops interpolating this shade. Callers do this when a new command
+    /// supersedes the target the interpolation was driving toward; the last
+    /// published position stands as our estimate until the hub tells us more.
+    fn cancel_motion(&self, shade_id: i32) {
+        if let Some(handle) = self.motion_tasks.lock().unwrap().remove(&shade_id) {
+            handle.abort();
+        }
+    }
+
+    fn last_published_pct(&self, key: &str) -> Option<u8> {
+        self.last_published_pos.lock().unwrap().get(key).copied()
+    }
+}
+
+/// Best estimate of where a rail is right now, and whether the shade is
+/// moving. Mid-motion our interpolated estimate beats the hub's REST value,
+/// which keeps reporting the position the shade started from.
+///
+/// Read this *before* calling `cancel_motion` — cancelling clears the
+/// in-motion flag this depends on.
+fn current_estimate(
+    state: &Arc<Pv2MqttState>,
+    shade_id: i32,
+    key: &str,
+    hub_pct: Option<u8>,
+) -> (bool, Option<u8>) {
+    let in_motion = state.is_in_motion(shade_id);
+    let current = if in_motion {
+        state.last_published_pct(key).or(hub_pct)
+    } else {
+        hub_pct
+    };
+    (in_motion, current)
 }
 
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -1710,6 +1809,42 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn position_command_plan_handles_mid_motion_retarget() {
+        use PositionCommandPlan::*;
+        // At rest: direction comes from the hub-reported position
+        assert_eq!(
+            plan_position_command(80, Some(20), false),
+            Send(Some("opening"))
+        );
+        assert_eq!(
+            plan_position_command(20, Some(80), false),
+            Send(Some("closing"))
+        );
+        // At rest and already parked there: skipping saves a hub round trip
+        assert_eq!(plan_position_command(50, Some(50), false), Skip);
+        // Mid-motion the same command must NOT be skipped — the shade is
+        // travelling away from that position, so dropping it strands the
+        // shade heading for the superseded target. No direction label,
+        // since it will simply stop about where it already is.
+        assert_eq!(plan_position_command(50, Some(50), true), Send(None));
+        // Mid-motion direction comes from the best-known position
+        assert_eq!(
+            plan_position_command(90, Some(50), true),
+            Send(Some("opening"))
+        );
+        assert_eq!(
+            plan_position_command(10, Some(50), true),
+            Send(Some("closing"))
+        );
+        // Position unknown: always send, assume opening
+        assert_eq!(
+            plan_position_command(50, None, false),
+            Send(Some("opening"))
+        );
+        assert_eq!(plan_position_command(50, None, true), Send(Some("opening")));
+    }
 
     #[test]
     fn interpolate_pct_covers_endpoints_midpoints_and_clamping() {
