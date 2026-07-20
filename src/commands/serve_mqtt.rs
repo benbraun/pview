@@ -1051,21 +1051,39 @@ impl ServeMqttCommand {
                 };
                 advise_hass_of_state_label(state, &shade_id_str, motion_state).await?;
                 // Cancel any previous interpolation task for this shade
-                state.cancel_motion(event.id);
+                let _ = state.cancel_motion(event.id);
                 // Spawn position interpolation if we have enough data
                 if let (Some(current), Some(target)) =
                     (event.current_positions, event.target_positions)
                 {
-                    if let Some(eta) = target.eta_in_seconds {
-                        let eta = (eta - 1.5).max(0.5);
+                    if let Some(hub_eta) = target.eta_in_seconds {
+                        // Derive the shade's travel rate so that a command
+                        // superseding this move can estimate its own ETA.
+                        let rail_distance = |c: Option<u8>, t: Option<u8>| match (c, t) {
+                            (Some(c), Some(t)) => c.abs_diff(t),
+                            _ => 0,
+                        };
+                        let distance = rail_distance(current.pos1_percent(), target.pos1_percent())
+                            .max(rail_distance(current.pos2_percent(), target.pos2_percent()));
+                        let secs_per_pct = if distance > 0 {
+                            hub_eta / distance as f64
+                        } else {
+                            0.0
+                        };
                         let abort = spawn_position_interpolation(
                             Arc::clone(state),
                             event.id,
                             current,
                             target,
-                            eta,
+                            interpolation_eta(hub_eta),
                         );
-                        state.motion_tasks.lock().unwrap().insert(event.id, abort);
+                        state.motion_tasks.lock().unwrap().insert(
+                            event.id,
+                            MotionTask {
+                                abort,
+                                secs_per_pct,
+                            },
+                        );
                     }
                 }
             }
@@ -1275,6 +1293,38 @@ struct SerialAndShade {
     #[serde(deserialize_with = "parse_deser")]
     shade_id: ShadeIdAddr,
 }
+/// An interpolation in flight for one shade.
+struct MotionTask {
+    abort: tokio::task::AbortHandle,
+    /// Seconds per percent of travel, derived from the hub's ETA for this
+    /// move. Retains the shade's observed speed (which depends on its
+    /// configured velocity) so a command that supersedes this move can
+    /// estimate its own ETA. Zero when the rate could not be derived.
+    secs_per_pct: f64,
+}
+
+/// The hub's ETA covers the whole move including deceleration and its own
+/// reporting lag, so finish interpolating slightly early rather than parking
+/// the graphic at the target while the shade is still travelling.
+fn interpolation_eta(hub_eta_secs: f64) -> f64 {
+    (hub_eta_secs - 1.5).max(0.5)
+}
+
+/// Estimates the ETA for a retargeted move from the travel rate observed on
+/// the move it supersedes. `None` when there is nothing worth animating.
+fn plan_retarget_interpolation(secs_per_pct: f64, current: u8, target: u8) -> Option<f64> {
+    if !secs_per_pct.is_finite() || secs_per_pct <= 0.0 {
+        return None;
+    }
+    let distance = current.abs_diff(target);
+    if distance == 0 {
+        return None;
+    }
+    Some(sanitize_eta_secs(interpolation_eta(
+        secs_per_pct * distance as f64,
+    )))
+}
+
 /// What to do about an incoming position command.
 #[derive(Debug, PartialEq)]
 enum PositionCommandPlan {
@@ -1369,11 +1419,20 @@ async fn mqtt_shade_set_position(
         }
         PositionCommandPlan::Send(label) => {
             // This command supersedes whatever target an interpolation was
-            // driving toward, so stop animating to the stale one.
-            state.cancel_motion(shade_id);
+            // driving toward: stop animating to the stale one and start
+            // animating from here to the new target.
+            let superseded = state.cancel_motion(shade_id);
             if let Some(label) = label {
                 advise_hass_of_state_label(&state, &shade_id_str, label).await?;
             }
+            retarget_interpolation(
+                &state,
+                shade_id,
+                is_secondary,
+                superseded,
+                current,
+                position,
+            );
         }
     }
     hub.hub.set_shade_position(shade_id, pos).await?;
@@ -1418,10 +1477,11 @@ async fn mqtt_shade_command(
                     return Ok(());
                 }
                 PositionCommandPlan::Send(label) => {
-                    state.cancel_motion(shade_id);
+                    let superseded = state.cancel_motion(shade_id);
                     if let Some(label) = label {
                         advise_hass_of_state_label(&state, &shade_id_str, label).await?;
                     }
+                    retarget_interpolation(&state, shade_id, false, superseded, current, 100);
                 }
             }
             let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
@@ -1445,10 +1505,11 @@ async fn mqtt_shade_command(
                     return Ok(());
                 }
                 PositionCommandPlan::Send(label) => {
-                    state.cancel_motion(shade_id);
+                    let superseded = state.cancel_motion(shade_id);
                     if let Some(label) = label {
                         advise_hass_of_state_label(&state, &shade_id_str, label).await?;
                     }
+                    retarget_interpolation(&state, shade_id, false, superseded, current, 0);
                 }
             }
             let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
@@ -1465,8 +1526,10 @@ async fn mqtt_shade_command(
         }
         "STOP" => {
             // The shade halts wherever it is, so any interpolation toward
-            // the old target is now wrong. MotionStopped reports the truth.
-            state.cancel_motion(shade_id);
+            // the old target is now wrong, and there is no new target to
+            // animate toward. MotionStopped reports where it actually
+            // ended up.
+            let _ = state.cancel_motion(shade_id);
             hub.hub
                 .move_shade(shade_id, ShadeUpdateMotion::Stop)
                 .await?;
@@ -1559,7 +1622,7 @@ struct Pv2MqttState {
     discovery_prefix: String,
     first_run: AtomicBool,
     responding: AtomicBool,
-    motion_tasks: std::sync::Mutex<HashMap<i32, tokio::task::AbortHandle>>,
+    motion_tasks: std::sync::Mutex<HashMap<i32, MotionTask>>,
     /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
     velocities: std::sync::Mutex<HashMap<i32, f64>>,
     /// Last percent published per rail (keyed like the mqtt topic id, so
@@ -1591,18 +1654,78 @@ impl Pv2MqttState {
         self.motion_tasks.lock().unwrap().contains_key(&shade_id)
     }
 
-    /// Stops interpolating this shade. Callers do this when a new command
-    /// supersedes the target the interpolation was driving toward; the last
-    /// published position stands as our estimate until the hub tells us more.
-    fn cancel_motion(&self, shade_id: i32) {
-        if let Some(handle) = self.motion_tasks.lock().unwrap().remove(&shade_id) {
-            handle.abort();
+    /// Stops interpolating this shade, returning the task that was in flight
+    /// so the caller can reuse its travel rate. Callers do this when a new
+    /// command supersedes the target the interpolation was driving toward.
+    fn cancel_motion(&self, shade_id: i32) -> Option<MotionTask> {
+        let task = self.motion_tasks.lock().unwrap().remove(&shade_id);
+        if let Some(task) = &task {
+            task.abort.abort();
         }
+        task
     }
 
     fn last_published_pct(&self, key: &str) -> Option<u8> {
         self.last_published_pos.lock().unwrap().get(key).copied()
     }
+}
+
+/// Starts interpolating from where we believe the shade is now toward a
+/// newly commanded target, reusing the travel rate of the move being
+/// superseded.
+///
+/// The hub does not reliably send a fresh `MotionStarted` when a shade that
+/// is already moving gets retargeted, so without this the reported position
+/// would sit frozen at the point of the new command until the shade stopped.
+/// If a `MotionStarted` does arrive it replaces this estimate with the hub's
+/// authoritative figures, and `MotionStopped` snaps to the true position
+/// either way.
+fn retarget_interpolation(
+    state: &Arc<Pv2MqttState>,
+    shade_id: i32,
+    is_secondary: bool,
+    superseded: Option<MotionTask>,
+    current: Option<u8>,
+    target_pct: u8,
+) {
+    let (Some(superseded), Some(current)) = (superseded, current) else {
+        return;
+    };
+    let Some(eta) = plan_retarget_interpolation(superseded.secs_per_pct, current, target_pct)
+    else {
+        return;
+    };
+    let rail = |pct: u8| {
+        let pos = ShadePosition::percent_to_pos(pct);
+        if is_secondary {
+            ShadePosition {
+                secondary: Some(pos),
+                ..Default::default()
+            }
+        } else {
+            ShadePosition {
+                primary: Some(pos),
+                ..Default::default()
+            }
+        }
+    };
+    log::debug!(
+        "Shade {shade_id} retargeted mid-motion: interpolating {current}% -> {target_pct}% over {eta:.1}s"
+    );
+    let abort = spawn_position_interpolation(
+        Arc::clone(state),
+        shade_id,
+        rail(current),
+        rail(target_pct),
+        eta,
+    );
+    state.motion_tasks.lock().unwrap().insert(
+        shade_id,
+        MotionTask {
+            abort,
+            secs_per_pct: superseded.secs_per_pct,
+        },
+    );
 }
 
 /// Best estimate of where a rail is right now, and whether the shade is
@@ -1809,6 +1932,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn retarget_interpolation_estimates_eta_from_observed_travel_rate() {
+        // 0.25s per percent: a 40% move takes 10s, less the finish-early margin
+        assert_eq!(plan_retarget_interpolation(0.25, 0, 40), Some(8.5));
+        // Only the distance matters, not the direction
+        assert_eq!(plan_retarget_interpolation(0.25, 40, 0), Some(8.5));
+        // Already there: nothing to animate
+        assert_eq!(plan_retarget_interpolation(0.25, 40, 40), None);
+        // Short hops keep a floor so the task isn't degenerate
+        assert_eq!(plan_retarget_interpolation(0.25, 40, 41), Some(0.5));
+        // No usable rate: don't invent one, leave it to the hub's next event
+        assert_eq!(plan_retarget_interpolation(f64::NAN, 0, 50), None);
+        assert_eq!(plan_retarget_interpolation(0.0, 0, 50), None);
+    }
 
     #[test]
     fn position_command_plan_handles_mid_motion_retarget() {
