@@ -1035,21 +1035,23 @@ impl ServeMqttCommand {
                 }
             }
             ShadeEventKind::MotionStarted => {
-                let shade_id_str = format!("{}", event.id);
-                // Determine opening vs closing from target vs current positions
-                let motion_state = match (&event.current_positions, &event.target_positions) {
+                let shade_id_str = rail_entity_id(event.id, false);
+                // A TDBU event names both rails whichever one was driven, so
+                // label each rail from its own travel. A rail that isn't
+                // moving gets nothing and keeps the state it already has.
+                match (&event.current_positions, &event.target_positions) {
                     (Some(cur), Some(tgt)) => {
-                        let cur_pct = cur.pos1_percent().unwrap_or(0);
-                        let tgt_pct = tgt.pos1_percent().unwrap_or(0);
-                        if tgt_pct >= cur_pct {
-                            "opening"
-                        } else {
-                            "closing"
+                        if let Some(label) = motion_label(cur.pos1_percent(), tgt.pos1_percent()) {
+                            advise_hass_of_state_label(state, &shade_id_str, label).await?;
+                        }
+                        if let Some(label) = motion_label(cur.pos2_percent(), tgt.pos2_percent()) {
+                            let sec_id = rail_entity_id(event.id, true);
+                            advise_hass_of_state_label(state, &sec_id, label).await?;
                         }
                     }
-                    _ => "opening",
-                };
-                advise_hass_of_state_label(state, &shade_id_str, motion_state).await?;
+                    // No positions to compare: all we know is that it moved.
+                    _ => advise_hass_of_state_label(state, &shade_id_str, "opening").await?,
+                }
                 // Cancel any previous interpolation task for this shade
                 let _ = state.cancel_motion(event.id);
                 // Spawn position interpolation if we have enough data
@@ -1325,6 +1327,48 @@ fn plan_retarget_interpolation(secs_per_pct: f64, current: u8, target: u8) -> Op
     )))
 }
 
+/// The MQTT entity id for one rail of a shade. TDBU shades expose the
+/// secondary (top) rail as a separate cover under the same device.
+fn rail_entity_id(shade_id: i32, is_secondary: bool) -> String {
+    if is_secondary {
+        format!("{shade_id}{SECONDARY_SUFFIX}")
+    } else {
+        format!("{shade_id}")
+    }
+}
+
+/// A position payload addressing a single rail. The v3 hub preserves axes
+/// omitted from the request body, so naming only the rail being moved
+/// leaves the other one where it is.
+fn rail_position(is_secondary: bool, pct: u8, velocity: Option<f64>) -> ShadePosition {
+    let pos = Some(ShadePosition::percent_to_pos(pct));
+    if is_secondary {
+        ShadePosition {
+            secondary: pos,
+            velocity,
+            ..Default::default()
+        }
+    } else {
+        ShadePosition {
+            primary: pos,
+            velocity,
+            ..Default::default()
+        }
+    }
+}
+
+/// Direction label for one rail of a `MotionStarted` event, from that
+/// rail's own travel. `None` means "say nothing": either the rail has no
+/// reported position, or it isn't moving on this event and must keep the
+/// state it already has rather than be told the other rail's direction.
+fn motion_label(current: Option<u8>, target: Option<u8>) -> Option<&'static str> {
+    match (current, target) {
+        (Some(cur), Some(tgt)) if tgt > cur => Some("opening"),
+        (Some(cur), Some(tgt)) if tgt < cur => Some("closing"),
+        _ => None,
+    }
+}
+
 /// What to do about an incoming position command.
 #[derive(Debug, PartialEq)]
 enum PositionCommandPlan {
@@ -1380,30 +1424,14 @@ async fn mqtt_shade_set_position(
     let shade = hub.hub.shade_by_id(shade_id).await?;
 
     let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
-    let pos = if is_secondary {
-        ShadePosition {
-            secondary: Some(ShadePosition::percent_to_pos(position)),
-            velocity,
-            ..Default::default()
-        }
-    } else {
-        ShadePosition {
-            primary: Some(ShadePosition::percent_to_pos(position)),
-            velocity,
-            ..Default::default()
-        }
-    };
+    let pos = rail_position(is_secondary, position, velocity);
 
     log::info!(
         "Set {shade_id} {} {} to {position}%",
         shade.pt_name,
         if is_secondary { "secondary" } else { "primary" }
     );
-    let shade_id_str = if is_secondary {
-        format!("{shade_id}{SECONDARY_SUFFIX}")
-    } else {
-        format!("{shade_id}")
-    };
+    let shade_id_str = rail_entity_id(shade_id, is_secondary);
     let hub_pct = if is_secondary {
         shade.pos2_percent()
     } else {
@@ -1449,7 +1477,7 @@ async fn mqtt_shade_command(
         serial,
         shade_id: ShadeIdAddr {
             shade_id,
-            is_secondary: _,
+            is_secondary,
         },
     }) = params;
 
@@ -1465,15 +1493,29 @@ async fn mqtt_shade_command(
     let hub = state.hub.load();
     let shade = hub.hub.shade_by_id(shade_id).await?;
 
-    log::info!("{command} {shade_id} {}", shade.pt_name);
-    let shade_id_str = format!("{shade_id}");
+    log::info!(
+        "{command} {shade_id} {} {}",
+        shade.pt_name,
+        if is_secondary { "secondary" } else { "primary" }
+    );
+    let shade_id_str = rail_entity_id(shade_id, is_secondary);
     match command.as_ref() {
-        "OPEN" => {
-            let (in_motion, current) =
-                current_estimate(&state, shade_id, &shade_id_str, shade.pos1_percent());
-            match plan_position_command(100, current, in_motion) {
+        // Both ends of the travel take the same path; only the target
+        // differs. Sharing it keeps the addressed rail in one place.
+        "OPEN" | "CLOSE" => {
+            let target = if command == "OPEN" { 100 } else { 0 };
+            let hub_pct = if is_secondary {
+                shade.pos2_percent()
+            } else {
+                shade.pos1_percent()
+            };
+            let (in_motion, current) = current_estimate(&state, shade_id, &shade_id_str, hub_pct);
+            match plan_position_command(target, current, in_motion) {
                 PositionCommandPlan::Skip => {
-                    log::info!("Shade {shade_id} already open, skipping duplicate OPEN command");
+                    log::info!(
+                        "Shade {shade_id_str} already at {target}%, \
+                         skipping duplicate {command} command"
+                    );
                     return Ok(());
                 }
                 PositionCommandPlan::Send(label) => {
@@ -1481,47 +1523,19 @@ async fn mqtt_shade_command(
                     if let Some(label) = label {
                         advise_hass_of_state_label(&state, &shade_id_str, label).await?;
                     }
-                    retarget_interpolation(&state, shade_id, false, superseded, current, 100);
+                    retarget_interpolation(
+                        &state,
+                        shade_id,
+                        is_secondary,
+                        superseded,
+                        current,
+                        target,
+                    );
                 }
             }
             let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
             hub.hub
-                .set_shade_position(
-                    shade_id,
-                    ShadePosition {
-                        primary: Some(1.0),
-                        velocity,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-        }
-        "CLOSE" => {
-            let (in_motion, current) =
-                current_estimate(&state, shade_id, &shade_id_str, shade.pos1_percent());
-            match plan_position_command(0, current, in_motion) {
-                PositionCommandPlan::Skip => {
-                    log::info!("Shade {shade_id} already closed, skipping duplicate CLOSE command");
-                    return Ok(());
-                }
-                PositionCommandPlan::Send(label) => {
-                    let superseded = state.cancel_motion(shade_id);
-                    if let Some(label) = label {
-                        advise_hass_of_state_label(&state, &shade_id_str, label).await?;
-                    }
-                    retarget_interpolation(&state, shade_id, false, superseded, current, 0);
-                }
-            }
-            let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
-            hub.hub
-                .set_shade_position(
-                    shade_id,
-                    ShadePosition {
-                        primary: Some(0.0),
-                        velocity,
-                        ..Default::default()
-                    },
-                )
+                .set_shade_position(shade_id, rail_position(is_secondary, target, velocity))
                 .await?;
         }
         "STOP" => {
@@ -1695,20 +1709,7 @@ fn retarget_interpolation(
     else {
         return;
     };
-    let rail = |pct: u8| {
-        let pos = ShadePosition::percent_to_pos(pct);
-        if is_secondary {
-            ShadePosition {
-                secondary: Some(pos),
-                ..Default::default()
-            }
-        } else {
-            ShadePosition {
-                primary: Some(pos),
-                ..Default::default()
-            }
-        }
-    };
+    let rail = |pct: u8| rail_position(is_secondary, pct, None);
     log::debug!(
         "Shade {shade_id} retargeted mid-motion: interpolating {current}% -> {target_pct}% over {eta:.1}s"
     );
@@ -1982,6 +1983,42 @@ mod tests {
             Send(Some("opening"))
         );
         assert_eq!(plan_position_command(50, None, true), Send(Some("opening")));
+    }
+
+    #[test]
+    fn motion_label_is_per_rail_and_silent_for_stationary_rails() {
+        // A rail that is actually travelling gets its own direction
+        assert_eq!(motion_label(Some(20), Some(80)), Some("opening"));
+        assert_eq!(motion_label(Some(80), Some(20)), Some("closing"));
+        // A TDBU move names both rails in the event, but only one of them
+        // is going anywhere. The stationary rail must not be labelled --
+        // reporting it as "opening" is what made the bottom rail claim to
+        // move whenever the top rail was driven.
+        assert_eq!(motion_label(Some(40), Some(40)), None);
+        assert_eq!(motion_label(Some(0), Some(0)), None);
+        assert_eq!(motion_label(Some(100), Some(100)), None);
+        // A rail the hub didn't report can't be labelled either
+        assert_eq!(motion_label(None, Some(50)), None);
+        assert_eq!(motion_label(Some(50), None), None);
+        assert_eq!(motion_label(None, None), None);
+    }
+
+    #[test]
+    fn rail_addressing_targets_the_commanded_rail() {
+        assert_eq!(rail_entity_id(42, false), "42");
+        assert_eq!(rail_entity_id(42, true), format!("42{SECONDARY_SUFFIX}"));
+
+        // OPEN/CLOSE on the top rail must move the top rail, not the
+        // bottom one, and must leave the other axis unset so the hub
+        // holds it where it is.
+        let top_open = rail_position(true, 100, None);
+        assert_eq!(top_open.secondary, Some(1.0));
+        assert_eq!(top_open.primary, None);
+
+        let bottom_close = rail_position(false, 0, Some(0.5));
+        assert_eq!(bottom_close.primary, Some(0.0));
+        assert_eq!(bottom_close.secondary, None);
+        assert_eq!(bottom_close.velocity, Some(0.5));
     }
 
     #[test]
