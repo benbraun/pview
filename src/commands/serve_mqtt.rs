@@ -68,6 +68,10 @@ enum ServerEvent {
     ShadeEvent(ShadeEvent),
     PeriodicStateUpdate,
     Register,
+    ReconcileMotion {
+        shade_id: i32,
+        generation: u64,
+    },
     HubDiscovered(ResolvedHub),
 }
 
@@ -817,6 +821,7 @@ fn spawn_position_interpolation(
     start: ShadePosition,
     target: ShadePosition,
     eta_secs: f64,
+    generation: u64,
 ) -> tokio::task::AbortHandle {
     let eta_secs = sanitize_eta_secs(eta_secs);
     let handle = tokio::spawn(async move {
@@ -850,8 +855,34 @@ fn spawn_position_interpolation(
                 break;
             }
         }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = state
+            .events
+            .send(ServerEvent::ReconcileMotion {
+                shade_id,
+                generation,
+            })
+            .await;
     });
     handle.abort_handle()
+}
+
+fn begin_interpolation(
+    state: &Arc<Pv2MqttState>,
+    shade_id: i32,
+    start: ShadePosition,
+    target: ShadePosition,
+    eta: f64,
+    secs_per_pct: f64,
+) -> MotionTask {
+    let generation = state.next_motion.fetch_add(1, Ordering::SeqCst);
+    let abort =
+        spawn_position_interpolation(state.clone(), shade_id, start, target, eta, generation);
+    MotionTask {
+        abort,
+        secs_per_pct,
+        generation,
+    }
 }
 
 async fn advise_hass_of_updated_position(
@@ -863,6 +894,23 @@ async fn advise_hass_of_updated_position(
     }
     if let Some(pct) = shade.pos2_percent() {
         advise_hass_of_position(&state, &format!("{}{SECONDARY_SUFFIX}", shade.id), pct).await?;
+    }
+    Ok(())
+}
+
+async fn publish_confirmed_position(
+    state: &Arc<Pv2MqttState>,
+    shade: &ShadeData,
+) -> anyhow::Result<()> {
+    advise_hass_of_updated_position(state, shade).await?;
+    for (key, pct) in [
+        (rail_entity_id(shade.id, false), shade.pos1_percent()),
+        (rail_entity_id(shade.id, true), shade.pos2_percent()),
+    ] {
+        if let Some(pct) = pct {
+            advise_hass_of_state_label(state, &key, if pct == 0 { "closed" } else { "open" })
+                .await?;
+        }
     }
     Ok(())
 }
@@ -939,6 +987,8 @@ impl ServeMqttCommand {
             offline: std::sync::Mutex::new(HashSet::new()),
             published: tokio::sync::Mutex::new(HashMap::new()),
             revision: AtomicU64::new(0),
+            next_motion: AtomicU64::new(1),
+            events: tx.clone(),
         });
 
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
@@ -1160,10 +1210,11 @@ impl ServeMqttCommand {
                 // Cancel any previous interpolation task for this shade
                 let _ = state.cancel_motion(event.id);
                 // Spawn position interpolation if we have enough data
-                if let (Some(current), Some(target)) =
-                    (event.current_positions, event.target_positions)
                 {
-                    if let Some(hub_eta) = target.eta_in_seconds {
+                    let current = event.current_positions.unwrap_or_default();
+                    let target = event.target_positions.unwrap_or_default();
+                    let hub_eta = target.eta_in_seconds.unwrap_or(30.0);
+                    {
                         // Derive the shade's travel rate so that a command
                         // superseding this move can estimate its own ETA.
                         let rail_distance = |c: Option<u8>, t: Option<u8>| match (c, t) {
@@ -1177,20 +1228,15 @@ impl ServeMqttCommand {
                         } else {
                             0.0
                         };
-                        let abort = spawn_position_interpolation(
-                            Arc::clone(state),
+                        let task = begin_interpolation(
+                            state,
                             event.id,
                             current,
                             target,
                             interpolation_eta(hub_eta),
+                            secs_per_pct,
                         );
-                        state.motion_tasks.lock().unwrap().insert(
-                            event.id,
-                            MotionTask {
-                                abort,
-                                secs_per_pct,
-                            },
-                        );
+                        state.motion_tasks.lock().unwrap().insert(event.id, task);
                     }
                 }
             }
@@ -1373,6 +1419,37 @@ impl ServeMqttCommand {
                     log::error!("During handle_discovery: {err:#?}");
                 }
             }
+            ServerEvent::ReconcileMotion {
+                shade_id,
+                generation,
+            } => {
+                if !state
+                    .motion_tasks
+                    .lock()
+                    .unwrap()
+                    .get(&shade_id)
+                    .map(|t| t.generation == generation)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                let result = state.hub.load().hub.shade_by_id(shade_id).await;
+                if !state.cancel_motion_generation(shade_id, generation) {
+                    return;
+                }
+                match result {
+                    Ok(shade) => {
+                        state.shades.lock().unwrap().insert(shade_id, shade.clone());
+                        if let Err(err) = publish_confirmed_position(state, &shade).await {
+                            log::warn!("Motion reconciliation: {err:#}");
+                        }
+                    }
+                    Err(err) => {
+                        state.offline.lock().unwrap().insert(shade_id);
+                        log::warn!("Motion reconciliation failed for {shade_id}: {err:#}");
+                    }
+                }
+            }
             ServerEvent::Register => {
                 state.published.lock().await.clear();
                 if let Err(err) = register_with_hass(state).await {
@@ -1461,6 +1538,7 @@ struct SerialAndShade {
 /// An interpolation in flight for one shade.
 struct MotionTask {
     abort: tokio::task::AbortHandle,
+    generation: u64,
     /// Seconds per percent of travel, derived from the hub's ETA for this
     /// move. Retains the shade's observed speed (which depends on its
     /// configured velocity) so a command that supersedes this move can
@@ -1609,6 +1687,17 @@ async fn mqtt_shade_set_position(
         shade.pos1_percent()
     };
     let (in_motion, current) = current_estimate(&state, shade_id, &shade_id_str, hub_pct);
+    if plan_position_command(position, current, in_motion) == PositionCommandPlan::Skip {
+        return Ok(());
+    }
+    let revision = state.revision.load(Ordering::SeqCst);
+    if let Err(err) = hub.hub.set_shade_position(shade_id, pos).await {
+        let _ = state.events.try_send(ServerEvent::PeriodicStateUpdate);
+        return Err(err);
+    }
+    if state.revision.load(Ordering::SeqCst) != revision {
+        return Ok(());
+    }
     match plan_position_command(position, current, in_motion) {
         PositionCommandPlan::Skip => {
             log::info!(
@@ -1634,7 +1723,6 @@ async fn mqtt_shade_set_position(
             );
         }
     }
-    hub.hub.set_shade_position(shade_id, pos).await?;
     Ok(())
 }
 
@@ -1677,55 +1765,46 @@ async fn mqtt_shade_command(
         shade.pt_name,
         if is_secondary { "secondary" } else { "primary" }
     );
-    let shade_id_str = rail_entity_id(shade_id, is_secondary);
     match command.as_ref() {
         // Both ends of the travel take the same path; only the target
         // differs. Sharing it keeps the addressed rail in one place.
         "OPEN" | "CLOSE" => {
             let target = if command == "OPEN" { 100 } else { 0 };
-            let hub_pct = if is_secondary {
-                shade.pos2_percent()
-            } else {
-                shade.pos1_percent()
-            };
-            let (in_motion, current) = current_estimate(&state, shade_id, &shade_id_str, hub_pct);
-            match plan_position_command(target, current, in_motion) {
-                PositionCommandPlan::Skip => {
-                    log::info!(
-                        "Shade {shade_id_str} already at {target}%, \
-                         skipping duplicate {command} command"
-                    );
-                    return Ok(());
-                }
-                PositionCommandPlan::Send(label) => {
-                    let superseded = state.cancel_motion(shade_id);
-                    if let Some(label) = label {
-                        advise_hass_of_state_label(&state, &shade_id_str, label).await?;
-                    }
-                    retarget_interpolation(
-                        &state,
+            return mqtt_shade_set_position(
+                Params(SerialAndShade {
+                    serial,
+                    shade_id: ShadeIdAddr {
                         shade_id,
                         is_secondary,
-                        superseded,
-                        current,
-                        target,
-                    );
-                }
-            }
-            let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
-            hub.hub
-                .set_shade_position(shade_id, rail_position(is_secondary, target, velocity))
-                .await?;
+                    },
+                }),
+                Topic(topic),
+                State(state),
+                Payload(target),
+            )
+            .await;
         }
         "STOP" => {
             // The shade halts wherever it is, so any interpolation toward
             // the old target is now wrong, and there is no new target to
             // animate toward. MotionStopped reports where it actually
             // ended up.
-            let _ = state.cancel_motion(shade_id);
+            let revision = state.revision.load(Ordering::SeqCst);
             hub.hub
                 .move_shade(shade_id, ShadeUpdateMotion::Stop)
                 .await?;
+            if state.revision.load(Ordering::SeqCst) == revision {
+                state.cancel_motion(shade_id);
+                let task = begin_interpolation(
+                    &state,
+                    shade_id,
+                    ShadePosition::default(),
+                    ShadePosition::default(),
+                    0.25,
+                    0.0,
+                );
+                state.motion_tasks.lock().unwrap().insert(shade_id, task);
+            }
         }
         "JOG" => {
             hub.hub.move_shade(shade_id, ShadeUpdateMotion::Jog).await?;
@@ -1820,6 +1899,8 @@ struct Pv2MqttState {
     offline: std::sync::Mutex<HashSet<i32>>,
     published: tokio::sync::Mutex<HashMap<String, String>>,
     revision: AtomicU64,
+    next_motion: AtomicU64,
+    events: tokio::sync::mpsc::Sender<ServerEvent>,
     /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
     velocities: std::sync::Mutex<HashMap<i32, f64>>,
     /// Last percent published per rail (keyed like the mqtt topic id, so
@@ -1862,6 +1943,17 @@ impl Pv2MqttState {
         task
     }
 
+    fn cancel_motion_generation(&self, shade_id: i32, generation: u64) -> bool {
+        let mut tasks = self.motion_tasks.lock().unwrap();
+        if tasks.get(&shade_id).map(|t| t.generation) != Some(generation) {
+            return false;
+        }
+        if let Some(task) = tasks.remove(&shade_id) {
+            task.abort.abort();
+        }
+        true
+    }
+
     fn last_published_pct(&self, key: &str) -> Option<u8> {
         self.last_published_pos.lock().unwrap().get(key).copied()
     }
@@ -1885,31 +1977,18 @@ fn retarget_interpolation(
     current: Option<u8>,
     target_pct: u8,
 ) {
-    let (Some(superseded), Some(current)) = (superseded, current) else {
-        return;
+    let rate = superseded.as_ref().map(|t| t.secs_per_pct).unwrap_or(0.0);
+    let eta = current.and_then(|c| plan_retarget_interpolation(rate, c, target_pct));
+    let (start, target, eta) = match (current, eta) {
+        (Some(current), Some(eta)) => (
+            rail_position(is_secondary, current, None),
+            rail_position(is_secondary, target_pct, None),
+            eta,
+        ),
+        _ => (ShadePosition::default(), ShadePosition::default(), 30.0),
     };
-    let Some(eta) = plan_retarget_interpolation(superseded.secs_per_pct, current, target_pct)
-    else {
-        return;
-    };
-    let rail = |pct: u8| rail_position(is_secondary, pct, None);
-    log::debug!(
-        "Shade {shade_id} retargeted mid-motion: interpolating {current}% -> {target_pct}% over {eta:.1}s"
-    );
-    let abort = spawn_position_interpolation(
-        Arc::clone(state),
-        shade_id,
-        rail(current),
-        rail(target_pct),
-        eta,
-    );
-    state.motion_tasks.lock().unwrap().insert(
-        shade_id,
-        MotionTask {
-            abort,
-            secs_per_pct: superseded.secs_per_pct,
-        },
-    );
+    let task = begin_interpolation(state, shade_id, start, target, eta, rate);
+    state.motion_tasks.lock().unwrap().insert(shade_id, task);
 }
 
 /// Best estimate of where a rail is right now, and whether the shade is
@@ -2116,6 +2195,69 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
+
+    fn test_state() -> (Arc<Pv2MqttState>, Receiver<ServerEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let gateway_data = serde_json::from_value(serde_json::json!({
+            "serialNumber": "test", "brand": "HD", "model": "G3",
+            "firmware": {"mainProcessor": {"name": "test", "revision": 1, "subRevision": 0, "build": 0}},
+            "networkStatus": {"ipAddress": "127.0.0.1", "primaryMacAddress": "00:00:00:00:00:00"}
+        })).unwrap();
+        (
+            Arc::new(Pv2MqttState {
+                hub: ArcSwap::new(Arc::new(FullyResolvedHub {
+                    hub: Hub::with_addr("127.0.0.1".parse().unwrap()),
+                    gateway_data,
+                })),
+                client: ArcSwap::new(Arc::new(Client::with_auto_id().unwrap())),
+                serial: "test".into(),
+                discovery_prefix: "homeassistant".into(),
+                first_run: AtomicBool::new(true),
+                responding: AtomicBool::new(true),
+                motion_tasks: std::sync::Mutex::new(HashMap::new()),
+                velocities: std::sync::Mutex::new(HashMap::new()),
+                last_published_pos: std::sync::Mutex::new(HashMap::new()),
+                shades: std::sync::Mutex::new(HashMap::new()),
+                offline: std::sync::Mutex::new(HashSet::new()),
+                published: tokio::sync::Mutex::new(HashMap::new()),
+                revision: AtomicU64::new(0),
+                next_motion: AtomicU64::new(1),
+                events: tx,
+            }),
+            rx,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_motion_is_reconciled_and_old_generations_cannot_cancel_new_moves() {
+        let (state, mut rx) = test_state();
+        let task = begin_interpolation(
+            &state,
+            1,
+            rail_position(false, 0, None),
+            rail_position(false, 100, None),
+            0.5,
+            0.01,
+        );
+        let first = task.generation;
+        state.motion_tasks.lock().unwrap().insert(1, task);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let event = rx.recv().await.unwrap();
+        assert!(
+            matches!(event, ServerEvent::ReconcileMotion { shade_id: 1, generation } if generation == first)
+        );
+        let replacement = begin_interpolation(
+            &state,
+            1,
+            rail_position(false, 50, None),
+            rail_position(false, 0, None),
+            2.0,
+            0.04,
+        );
+        state.motion_tasks.lock().unwrap().insert(1, replacement);
+        assert!(!state.cancel_motion_generation(1, first));
+        assert!(state.is_in_motion(1));
+    }
 
     #[test]
     fn snapshot_policy_preserves_live_motion_and_newer_events() {
