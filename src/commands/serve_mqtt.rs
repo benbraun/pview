@@ -445,7 +445,10 @@ async fn register_shades(
     let hub = state.hub.load();
     let revision = state.revision.load(Ordering::SeqCst);
     let shades = hub.hub.list_shades(None).await?;
-    cache_snapshot(state, &shades, revision);
+    {
+        let _guard = state.telemetry.lock().await;
+        cache_snapshot(state, &shades, revision);
+    }
     let room_by_id: HashMap<i32, String> = hub
         .hub
         .list_rooms()
@@ -848,7 +851,19 @@ fn inventory_signature(mut value: serde_json::Value) -> serde_json::Value {
     value
 }
 
+// Call under the telemetry gate. A successful snapshot is also the recovery
+// path when a saturated background queue could not accept watchdog work.
 fn cache_snapshot(state: &Pv2MqttState, shades: &[ShadeData], revision: u64) {
+    if revision == state.revision.load(Ordering::SeqCst) {
+        let now = tokio::time::Instant::now();
+        state.motion_tasks.lock().unwrap().retain(|id, task| {
+            let keep = task.deadline > now && shades.iter().any(|shade| shade.id == *id);
+            if !keep {
+                task.abort.abort();
+            }
+            keep
+        });
+    }
     let mut cache = state.shades.lock().unwrap();
     cache.retain(|id, _| shades.iter().any(|s| s.id == *id));
     for shade in shades {
@@ -2776,6 +2791,24 @@ mod tests {
             discovery_prefix: "homeassistant".into(),
             state_file: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_snapshot_recovers_when_motion_watchdog_delivery_is_lost() {
+        let (state, _rx) = test_state();
+        let task = begin_interpolation(
+            &state,
+            7,
+            ShadePosition::default(),
+            ShadePosition::default(),
+            0.25,
+            0.0,
+        );
+        task.abort.abort(); // Simulate a watchdog whose queued work could not be delivered.
+        state.motion_tasks.lock().unwrap().insert(7, task);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        cache_snapshot(&state, &[test_shade(7)], 0);
+        assert!(!state.is_in_motion(7));
     }
 
     #[tokio::test]

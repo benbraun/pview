@@ -41,7 +41,7 @@ Independent review identified six correctness issues. Follow-up commits address 
 
 ### Validation and practical limits
 
-- TLS and no-TLS suites: 29 tests pass in each configuration.
+- TLS and no-TLS suites: 30 tests pass in each configuration.
 - Formatting and whitespace checks pass. Stable rustfmt warns that the existing `imports_granularity` option requires nightly.
 - Clippy completes with three existing warnings (`build.rs` needless borrow, `ShadeData::name` returning the decoded name, and `Args::hub_ip` cloning a Copy value). Strict `-D warnings` fails on these existing warnings.
 - Loopback HTTP fixtures consume complete requests, enforce socket deadlines, and check request paths/body.
@@ -50,3 +50,5 @@ Independent review identified six correctness issues. Follow-up commits address 
 - Ruling: keep commands serialized and prioritize STOP over pending work; an already-sent REST command cannot safely be preempted. Under saturation STOP may discard lower-priority queued work, with a warning; an all-STOP queue remains bounded.
 - Ruling: use retained discovery and state, with explicit persisted cleanup, rather than registration sleeps. This adds retained broker state but removes subscription timing dependence.
 - Ruling: keep the feature branch local. No push, merge or deployment was requested.
+
+Final resilience check: successful snapshots clear expired motion tracking even if watchdog work was dropped under queue saturation; regression reproduced before repair.
