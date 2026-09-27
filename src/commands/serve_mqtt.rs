@@ -15,10 +15,10 @@ use futures_util::StreamExt;
 use mosquitto_rs::router::*;
 use mosquitto_rs::*;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
@@ -67,6 +67,7 @@ enum ServerEvent {
     },
     ShadeEvent(ShadeEvent),
     PeriodicStateUpdate,
+    Register,
     HubDiscovered(ResolvedHub),
 }
 
@@ -142,11 +143,7 @@ impl HassRegistration {
                         tokio::time::sleep(duration).await;
                     }
                     RegEntry::Msg { topic, payload } => {
-                        state
-                            .client
-                            .load()
-                            .publish(&topic, payload.as_bytes(), QoS::AtMostOnce, false)
-                            .await?;
+                        publish_changed(state, topic, payload).await?;
                     }
                 }
             }
@@ -268,8 +265,9 @@ async fn register_shades(
     reg: &mut HassRegistration,
 ) -> anyhow::Result<()> {
     let hub = state.hub.load();
+    let revision = state.revision.load(Ordering::SeqCst);
     let shades = hub.hub.list_shades(None).await?;
-    *state.shades.lock().unwrap() = shades.iter().map(|s| (s.id, s.clone())).collect();
+    cache_snapshot(state, &shades, revision);
     let room_by_id: HashMap<i32, String> = hub
         .hub
         .list_rooms()
@@ -356,8 +354,21 @@ async fn register_shades(
                 ),
                 serde_json::to_string(&config)?,
             );
-            reg.update(config.base.availability_topic, "online");
-            if let Some(pos) = pos {
+            reg.update(
+                config.base.availability_topic,
+                if state.offline.lock().unwrap().contains(&shade.id) {
+                    "offline"
+                } else {
+                    "online"
+                },
+            );
+            if let Some(pos) = pos.filter(|_| {
+                snapshot_is_current(
+                    state.is_in_motion(shade.id),
+                    revision,
+                    state.revision.load(Ordering::SeqCst),
+                )
+            }) {
                 reg.update(
                     format!("{MODEL}/shade/{serial}/{shade_id}/position"),
                     format!("{pos}"),
@@ -629,6 +640,107 @@ async fn register_with_hass(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn snapshot_is_current(moving: bool, before: u64, now: u64) -> bool {
+    !moving && before == now
+}
+
+fn inventory_signature(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        for key in ["positions", "batteryStatus", "signalStrength"] {
+            object.remove(key);
+        }
+    }
+    value
+}
+
+fn cache_snapshot(state: &Pv2MqttState, shades: &[ShadeData], revision: u64) {
+    let mut cache = state.shades.lock().unwrap();
+    cache.retain(|id, _| shades.iter().any(|s| s.id == *id));
+    for shade in shades {
+        let mut shade = shade.clone();
+        if !snapshot_is_current(
+            state.is_in_motion(shade.id),
+            revision,
+            state.revision.load(Ordering::SeqCst),
+        ) {
+            if let Some(previous) = cache.get(&shade.id) {
+                shade.positions = previous.positions.clone();
+            }
+        }
+        cache.insert(shade.id, shade);
+    }
+}
+
+async fn publish_changed(
+    state: &Arc<Pv2MqttState>,
+    topic: String,
+    payload: String,
+) -> anyhow::Result<()> {
+    let mut published = state.published.lock().await;
+    if published.get(&topic) == Some(&payload) {
+        return Ok(());
+    }
+    state
+        .client
+        .load()
+        .publish(&topic, payload.as_bytes(), QoS::AtMostOnce, false)
+        .await?;
+    published.insert(topic, payload);
+    Ok(())
+}
+
+async fn refresh_shades(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
+    let revision = state.revision.load(Ordering::SeqCst);
+    let shades = state.hub.load().hub.list_shades(None).await?;
+    let changed = {
+        let cache = state.shades.lock().unwrap();
+        cache.len() != shades.len()
+            || shades.iter().any(|shade| {
+                cache
+                    .get(&shade.id)
+                    .map(|old| inventory_signature(serde_json::to_value(old).unwrap()))
+                    != Some(inventory_signature(serde_json::to_value(shade).unwrap()))
+            })
+    };
+    cache_snapshot(state, &shades, revision);
+    if changed {
+        return register_with_hass(state).await;
+    }
+    for shade in shades {
+        if snapshot_is_current(
+            state.is_in_motion(shade.id),
+            revision,
+            state.revision.load(Ordering::SeqCst),
+        ) && !state.offline.lock().unwrap().contains(&shade.id)
+        {
+            advise_hass_of_updated_position(state, &shade).await?;
+            for (key, pct) in [
+                (rail_entity_id(shade.id, false), shade.pos1_percent()),
+                (rail_entity_id(shade.id, true), shade.pos2_percent()),
+            ] {
+                if let Some(pct) = pct {
+                    advise_hass_of_state_label(
+                        state,
+                        &key,
+                        if pct == 0 { "closed" } else { "open" },
+                    )
+                    .await?;
+                }
+            }
+        }
+        advise_hass_of_battery_level(state, &shade).await?;
+        if let Some(dbm) = shade.signal_strength {
+            publish_changed(
+                state,
+                format!("{MODEL}/sensor/{}-{}-signal/state", state.serial, shade.id),
+                format!("{dbm:.0}"),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn advise_hass_of_unresponsive(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
     log::info!("Marking hub status as unresponsive");
     state.responding.store(false, Ordering::SeqCst);
@@ -650,19 +762,12 @@ async fn advise_hass_of_state_label(
     shade_id: &str,
     shade_state: &str,
 ) -> anyhow::Result<()> {
-    state
-        .client
-        .load()
-        .publish(
-            &format!(
-                "{MODEL}/shade/{serial}/{shade_id}/state",
-                serial = state.serial
-            ),
-            &shade_state.as_bytes(),
-            QoS::AtMostOnce,
-            false,
-        )
-        .await?;
+    publish_changed(
+        state,
+        format!("{MODEL}/shade/{}/{shade_id}/state", state.serial),
+        shade_state.to_string(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -671,19 +776,12 @@ async fn advise_hass_of_position(
     shade_id: &str,
     position: u8,
 ) -> anyhow::Result<()> {
-    state
-        .client
-        .load()
-        .publish(
-            &format!(
-                "{MODEL}/shade/{serial}/{shade_id}/position",
-                serial = state.serial
-            ),
-            &format!("{position}").as_bytes(),
-            QoS::AtMostOnce,
-            false,
-        )
-        .await?;
+    publish_changed(
+        state,
+        format!("{MODEL}/shade/{}/{shade_id}/position", state.serial),
+        position.to_string(),
+    )
+    .await?;
     state
         .last_published_pos
         .lock()
@@ -777,22 +875,10 @@ async fn advise_hass_of_battery_level(
     let state_topic = state.battery_state_topic(shade);
 
     if let Some(pct) = shade.battery_percent() {
-        state
-            .client
-            .load()
-            .publish(state_topic, format!("{pct}"), QoS::AtMostOnce, false)
-            .await?;
-        state
-            .client
-            .load()
-            .publish(availability_topic, "online", QoS::AtMostOnce, false)
-            .await?;
+        publish_changed(state, state_topic, pct.to_string()).await?;
+        publish_changed(state, availability_topic, "online".into()).await?;
     } else {
-        state
-            .client
-            .load()
-            .publish(availability_topic, "offline", QoS::AtMostOnce, false)
-            .await?;
+        publish_changed(state, availability_topic, "offline".into()).await?;
     }
 
     Ok(())
@@ -850,6 +936,9 @@ impl ServeMqttCommand {
             velocities: std::sync::Mutex::new(HashMap::new()),
             last_published_pos: std::sync::Mutex::new(HashMap::new()),
             shades: std::sync::Mutex::new(HashMap::new()),
+            offline: std::sync::Mutex::new(HashSet::new()),
+            published: tokio::sync::Mutex::new(HashMap::new()),
+            revision: AtomicU64::new(0),
         });
 
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
@@ -867,9 +956,16 @@ impl ServeMqttCommand {
         {
             let tx = tx.clone();
             tokio::spawn(async move {
+                let mut ticks = 0;
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
-                    if let Err(err) = tx.send(ServerEvent::PeriodicStateUpdate).await {
+                    ticks += 1;
+                    let event = if ticks % 15 == 0 {
+                        ServerEvent::Register
+                    } else {
+                        ServerEvent::PeriodicStateUpdate
+                    };
+                    if let Err(err) = tx.send(event).await {
                         log::error!("{err:#?}");
                         break;
                     }
@@ -1017,6 +1113,7 @@ impl ServeMqttCommand {
         event: ShadeEvent,
     ) -> anyhow::Result<()> {
         log::debug!("SSE shade event: {event:#?}");
+        state.revision.fetch_add(1, Ordering::SeqCst);
         let hub = state.hub.load();
         if let Some(positions) = &event.current_positions {
             if let Some(shade) = state.shades.lock().unwrap().get_mut(&event.id) {
@@ -1098,6 +1195,7 @@ impl ServeMqttCommand {
                 }
             }
             ShadeEventKind::ShadeOffline => {
+                state.offline.lock().unwrap().insert(event.id);
                 state
                     .client
                     .load()
@@ -1129,6 +1227,9 @@ impl ServeMqttCommand {
                     .await?;
             }
             ShadeEventKind::ShadeOnline | ShadeEventKind::BatteryAlert => {
+                if event.evt == ShadeEventKind::ShadeOnline {
+                    state.offline.lock().unwrap().remove(&event.id);
+                }
                 match hub.hub.shade_by_id(event.id).await {
                     Ok(shade) => {
                         state
@@ -1272,8 +1373,14 @@ impl ServeMqttCommand {
                     log::error!("During handle_discovery: {err:#?}");
                 }
             }
+            ServerEvent::Register => {
+                state.published.lock().await.clear();
+                if let Err(err) = register_with_hass(state).await {
+                    log::error!("Registering with HA: {err:#}");
+                }
+            }
             ServerEvent::PeriodicStateUpdate => {
-                if let Err(err) = register_with_hass(&state).await {
+                if let Err(err) = refresh_shades(state).await {
                     log::error!("During register_with_hass: {err:#?}");
                     let mut unresponsive = false;
                     for cause in err.chain() {
@@ -1710,6 +1817,9 @@ struct Pv2MqttState {
     responding: AtomicBool,
     motion_tasks: std::sync::Mutex<HashMap<i32, MotionTask>>,
     shades: std::sync::Mutex<HashMap<i32, ShadeData>>,
+    offline: std::sync::Mutex<HashSet<i32>>,
+    published: tokio::sync::Mutex<HashMap<String, String>>,
+    revision: AtomicU64,
     /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
     velocities: std::sync::Mutex<HashMap<i32, f64>>,
     /// Last percent published per rail (keyed like the mqtt topic id, so
@@ -1922,7 +2032,7 @@ async fn connect_mqtt_session(
     state.client.store(Arc::new(client.clone()));
     // Ask the serve loop to re-register everything with hass; that path
     // tolerates (and reports) an unresponsive hub instead of failing us.
-    tx.send(ServerEvent::PeriodicStateUpdate).await.ok();
+    tx.send(ServerEvent::Register).await.ok();
     Ok((client, subscriber, router))
 }
 
@@ -1964,7 +2074,7 @@ async fn mqtt_event_pump(
                         .context("resubscribing after mqtt reconnect")?;
                     need_rebuild = false;
                     // Re-register with hass via the fault-tolerant serve loop path
-                    tx.send(ServerEvent::PeriodicStateUpdate).await.ok();
+                    tx.send(ServerEvent::Register).await.ok();
                 }
             }
         }
@@ -2006,6 +2116,24 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn snapshot_policy_preserves_live_motion_and_newer_events() {
+        assert!(snapshot_is_current(false, 10, 10));
+        assert!(!snapshot_is_current(true, 10, 10));
+        assert!(!snapshot_is_current(false, 10, 11));
+    }
+
+    #[test]
+    fn inventory_signature_ignores_telemetry_but_tracks_configuration() {
+        let mut value = serde_json::json!({"id": 1, "ptName": "Shade", "positions": {"primary": 0.0}, "batteryStatus": 3, "signalStrength": -50});
+        let before = inventory_signature(value.clone());
+        value["positions"]["primary"] = serde_json::json!(1.0);
+        value["batteryStatus"] = serde_json::json!(1);
+        assert_eq!(before, inventory_signature(value.clone()));
+        value["ptName"] = serde_json::json!("Renamed");
+        assert_ne!(before, inventory_signature(value));
+    }
 
     #[test]
     fn retarget_interpolation_estimates_eta_from_observed_travel_rate() {
