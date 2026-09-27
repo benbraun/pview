@@ -323,3 +323,11 @@ volume. Standalone runs default to `$XDG_STATE_HOME/pview/` or
 `PV_STATE_FILE` or `serve-mqtt --state-file`. Back up this file with the service.
 Velocity 0 uses the hub default; 1–6 is applied and displayed as 7%; invalid or
 non-finite values are rejected. Use separate state files for separate hubs.
+
+## Bridge diagnostics
+
+The hub device includes SSE connection status, MQTT reconnect count, failed
+command count, last command latency (including queue time, in milliseconds),
+and the timestamp of the last completed shade reconciliation. Counters reset
+when the bridge restarts. Battery Estimate is a coarse percentage derived from
+the hub's No Power / Low / Medium / High categories, not a measured charge level.

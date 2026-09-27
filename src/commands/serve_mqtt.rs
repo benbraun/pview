@@ -68,10 +68,12 @@ enum ServerEvent {
     MqttMessage {
         router: Arc<MqttRouter<Arc<Pv2MqttState>>>,
         msg: Message,
+        received: std::time::Instant,
     },
     ShadeEvent(ShadeEvent),
     PeriodicStateUpdate,
     Register,
+    Diagnostics,
     ReconcileMotion {
         shade_id: i32,
         generation: u64,
@@ -257,6 +259,60 @@ async fn register_diagnostic_entity(
     Ok(())
 }
 
+fn runtime_diagnostics(state: &Pv2MqttState) -> Vec<DiagnosticEntity> {
+    [
+        (
+            "SSE Connection",
+            "sse",
+            if state.sse_connected.load(Ordering::SeqCst) {
+                "connected"
+            } else {
+                "disconnected"
+            }
+            .to_string(),
+        ),
+        (
+            "MQTT Reconnects",
+            "mqtt-reconnects",
+            state.mqtt_reconnects.load(Ordering::SeqCst).to_string(),
+        ),
+        (
+            "Command Failures",
+            "command-failures",
+            state.command_failures.load(Ordering::SeqCst).to_string(),
+        ),
+        (
+            "Last Command Latency (ms)",
+            "command-latency",
+            state.last_command_ms.load(Ordering::SeqCst).to_string(),
+        ),
+        (
+            "Last Reconciliation",
+            "last-reconciliation",
+            state.last_reconciliation.lock().unwrap().clone(),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, key, value)| DiagnosticEntity {
+        name: name.into(),
+        unique_id: format!("{}-{key}", state.serial),
+        value,
+    })
+    .collect()
+}
+
+async fn publish_runtime_diagnostics(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
+    for diagnostic in runtime_diagnostics(state) {
+        publish_changed(
+            state,
+            format!("{MODEL}/sensor/{}/state", diagnostic.unique_id),
+            diagnostic.value,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn register_hub(
     gateway_data: &GatewayConfig,
     state: &Arc<Pv2MqttState>,
@@ -292,6 +348,9 @@ async fn register_hub(
     )
     .await?;
 
+    for diagnostic in runtime_diagnostics(state) {
+        register_diagnostic_entity(diagnostic, gateway_data, state, reg).await?;
+    }
     Ok(())
 }
 
@@ -533,7 +592,7 @@ async fn register_shades(
             let battery = SensorConfig {
                 base: EntityConfig {
                     unique_id: format!("{device_id}-battery"),
-                    name: Some("Battery".to_string()),
+                    name: Some("Battery Estimate".to_string()),
                     availability_topic: state.battery_availability_topic(shade),
                     device_class: Some("battery".to_string()),
                     origin: Origin::default(),
@@ -869,6 +928,8 @@ async fn refresh_shades(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
             .await?;
         }
     }
+    *state.last_reconciliation.lock().unwrap() = chrono::Utc::now().to_rfc3339();
+    publish_runtime_diagnostics(state).await?;
     Ok(())
 }
 
@@ -893,6 +954,11 @@ fn discovery_payload(payload: &str, serial: &str) -> anyhow::Result<String> {
         if !topics.contains(&topic) {
             topics.push(topic);
         }
+    }
+    if value["entity_category"] == "diagnostic"
+        && value["device"]["identifiers"][0] == format!("{MODEL}-{serial}")
+    {
+        topics.retain(|topic| topic != &format!("{MODEL}/hub/{serial}/availability"));
     }
     value["availability_mode"] = serde_json::json!("all");
     value["availability"] = serde_json::json!(topics
@@ -1243,6 +1309,11 @@ impl ServeMqttCommand {
             revision: AtomicU64::new(0),
             next_motion: AtomicU64::new(1),
             events: tx.clone(),
+            sse_connected: AtomicBool::new(false),
+            mqtt_reconnects: AtomicU64::new(0),
+            command_failures: AtomicU64::new(0),
+            last_command_ms: AtomicU64::new(0),
+            last_reconciliation: std::sync::Mutex::new("Never".into()),
             state_file: Some(state_file),
             persistence: tokio::sync::Mutex::new(()),
             hub_changed: tokio::sync::watch::channel(resolved.hub.addr()).0,
@@ -1342,10 +1413,13 @@ impl ServeMqttCommand {
                     let state = state.clone();
                     let tx = tx.clone();
                     async move {
+                        let result = async {
                         let mut changed = state.hub_changed.subscribe();
                         let hub = state.hub.load().hub.clone();
                         let stream = hub.shade_events_stream().await?;
                         tokio::pin!(stream);
+                        state.sse_connected.store(true, Ordering::SeqCst);
+                        let _ = tx.send(ServerEvent::Diagnostics).await;
                         tx.send(ServerEvent::PeriodicStateUpdate).await?;
                         let motions: Vec<_> = state.motion_tasks.lock().unwrap().iter().map(|(id, task)| (*id, task.generation)).collect();
                         for (shade_id, generation) in motions { tx.send(ServerEvent::ReconcileMotion { shade_id, generation }).await?; }
@@ -1358,6 +1432,10 @@ impl ServeMqttCommand {
                                 }
                             }
                         }
+                        }.await;
+                        state.sse_connected.store(false, Ordering::SeqCst);
+                        let _ = tx.send(ServerEvent::Diagnostics).await;
+                        result
                     }
                 }).await;
             });
@@ -1397,7 +1475,8 @@ impl ServeMqttCommand {
                                         .await?
                                 }
                             };
-                            mqtt_event_pump(client, subscriber, router, tx, discovery_prefix).await
+                            mqtt_event_pump(client, subscriber, router, tx, discovery_prefix, state)
+                                .await
                         }
                     },
                 )
@@ -1636,8 +1715,24 @@ impl ServeMqttCommand {
 
     async fn process_event(&self, msg: ServerEvent, state: &Arc<Pv2MqttState>) {
         match msg {
-            ServerEvent::MqttMessage { msg, router } => {
-                if let Err(err) = self.handle_mqtt_message(msg, &state, &router).await {
+            ServerEvent::MqttMessage {
+                msg,
+                router,
+                received,
+            } => {
+                let command = msg.topic != format!("{}/status", self.discovery_prefix);
+                let result = self.handle_mqtt_message(msg, state, &router).await;
+                if command {
+                    state.last_command_ms.store(
+                        received.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        Ordering::SeqCst,
+                    );
+                    if result.is_err() {
+                        state.command_failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = publish_runtime_diagnostics(state).await;
+                }
+                if let Err(err) = result {
                     log::error!("handling mqtt message: {err:#}");
                 }
             }
@@ -1681,6 +1776,9 @@ impl ServeMqttCommand {
                         log::warn!("Motion reconciliation failed for {shade_id}: {err:#}");
                     }
                 }
+            }
+            ServerEvent::Diagnostics => {
+                let _ = publish_runtime_diagnostics(state).await;
             }
             ServerEvent::Register => {
                 state.published.lock().await.clear();
@@ -2183,6 +2281,11 @@ struct Pv2MqttState {
     revision: AtomicU64,
     next_motion: AtomicU64,
     events: tokio::sync::mpsc::Sender<ServerEvent>,
+    sse_connected: AtomicBool,
+    mqtt_reconnects: AtomicU64,
+    command_failures: AtomicU64,
+    last_command_ms: AtomicU64,
+    last_reconciliation: std::sync::Mutex<String>,
     hub_changed: tokio::sync::watch::Sender<std::net::IpAddr>,
     /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
     velocities: std::sync::Mutex<HashMap<i32, f64>>,
@@ -2420,6 +2523,7 @@ async fn connect_mqtt_session(
         .ok_or_else(|| anyhow::anyhow!("subscriber channel unavailable on new client"))?;
     let router = build_router(&client, discovery_prefix).await?;
     state.client.store(Arc::new(client.clone()));
+    state.mqtt_reconnects.fetch_add(1, Ordering::SeqCst);
     // Ask the serve loop to re-register everything with hass; that path
     // tolerates (and reports) an unresponsive hub instead of failing us.
     tx.send(ServerEvent::Register).await.ok();
@@ -2436,6 +2540,7 @@ async fn mqtt_event_pump(
     mut router: Arc<MqttRouter<Arc<Pv2MqttState>>>,
     tx: tokio::sync::mpsc::Sender<ServerEvent>,
     discovery_prefix: String,
+    state: Arc<Pv2MqttState>,
 ) -> anyhow::Result<()> {
     let mut need_rebuild = false;
     loop {
@@ -2448,6 +2553,7 @@ async fn mqtt_event_pump(
                 tx.send(ServerEvent::MqttMessage {
                     msg,
                     router: router.clone(),
+                    received: std::time::Instant::now(),
                 })
                 .await
                 .context("serve loop is gone")?;
@@ -2459,6 +2565,7 @@ async fn mqtt_event_pump(
             Event::Connected(status) => {
                 log::info!("MQTT (re)connected {status}");
                 if need_rebuild {
+                    state.mqtt_reconnects.fetch_add(1, Ordering::SeqCst);
                     router = build_router(&client, &discovery_prefix)
                         .await
                         .context("resubscribing after mqtt reconnect")?;
@@ -2535,6 +2642,11 @@ mod tests {
                 revision: AtomicU64::new(0),
                 next_motion: AtomicU64::new(1),
                 events: tx,
+                sse_connected: AtomicBool::new(false),
+                mqtt_reconnects: AtomicU64::new(0),
+                command_failures: AtomicU64::new(0),
+                last_command_ms: AtomicU64::new(0),
+                last_reconciliation: std::sync::Mutex::new("Never".into()),
                 state_file: None,
                 persistence: tokio::sync::Mutex::new(()),
                 hub_changed: tokio::sync::watch::channel("127.0.0.1".parse().unwrap()).0,
@@ -2572,6 +2684,22 @@ mod tests {
         state.motion_tasks.lock().unwrap().insert(1, replacement);
         assert!(!state.cancel_motion_generation(1, first));
         assert!(state.is_in_motion(1));
+    }
+
+    #[tokio::test]
+    async fn runtime_diagnostics_report_failures_and_connection_state() {
+        let (state, _rx) = test_state();
+        state.command_failures.store(2, Ordering::SeqCst);
+        state.last_command_ms.store(150, Ordering::SeqCst);
+        state.mqtt_reconnects.store(3, Ordering::SeqCst);
+        let values: HashMap<_, _> = runtime_diagnostics(&state)
+            .into_iter()
+            .map(|d| (d.unique_id, d.value))
+            .collect();
+        assert_eq!(values["test-sse"], "disconnected");
+        assert_eq!(values["test-command-failures"], "2");
+        assert_eq!(values["test-command-latency"], "150");
+        assert_eq!(values["test-mqtt-reconnects"], "3");
     }
 
     #[test]
