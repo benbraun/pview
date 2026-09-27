@@ -1184,6 +1184,9 @@ fn begin_interpolation(
         abort,
         secs_per_pct,
         generation,
+        deadline: tokio::time::Instant::now()
+            + Duration::from_secs_f64(sanitize_eta_secs(eta))
+            + Duration::from_secs(3),
     }
 }
 
@@ -1218,8 +1221,7 @@ async fn publish_confirmed_position(
         (rail_entity_id(shade.id, true), shade.pos2_percent()),
     ] {
         if let Some(pct) = pct {
-            advise_hass_of_state_label(state, &key, if pct == 0 { "closed" } else { "open" })
-                .await?;
+            advise_hass_of_state_label(state, &key, settled_label(state, &key, pct)).await?;
         }
     }
     Ok(())
@@ -1578,29 +1580,12 @@ impl ServeMqttCommand {
                 }
             }
             ShadeEventKind::MotionStarted => {
-                let shade_id_str = rail_entity_id(event.id, false);
-                // A TDBU event names both rails whichever one was driven, so
-                // label each rail from its own travel. A rail that isn't
-                // moving gets nothing and keeps the state it already has.
-                match (&event.current_positions, &event.target_positions) {
-                    (Some(cur), Some(tgt)) => {
-                        if let Some(label) = motion_label(cur.pos1_percent(), tgt.pos1_percent()) {
-                            advise_hass_of_state_label(state, &shade_id_str, label).await?;
-                        }
-                        if let Some(label) = motion_label(cur.pos2_percent(), tgt.pos2_percent()) {
-                            let sec_id = rail_entity_id(event.id, true);
-                            advise_hass_of_state_label(state, &sec_id, label).await?;
-                        }
-                    }
-                    // No positions to compare: all we know is that it moved.
-                    _ => advise_hass_of_state_label(state, &shade_id_str, "opening").await?,
-                }
                 // Cancel any previous interpolation task for this shade
                 let _ = state.cancel_motion(event.id);
                 // Spawn position interpolation if we have enough data
                 {
-                    let current = event.current_positions.unwrap_or_default();
-                    let target = event.target_positions.unwrap_or_default();
+                    let current = event.current_positions.clone().unwrap_or_default();
+                    let target = event.target_positions.clone().unwrap_or_default();
                     let hub_eta = target.eta_in_seconds.unwrap_or(30.0);
                     {
                         // Derive the shade's travel rate so that a command
@@ -1626,6 +1611,23 @@ impl ServeMqttCommand {
                         );
                         state.motion_tasks.lock().unwrap().insert(event.id, task);
                     }
+                }
+                let shade_id_str = rail_entity_id(event.id, false);
+                // A TDBU event names both rails whichever one was driven, so
+                // label each rail from its own travel. A rail that isn't
+                // moving gets nothing and keeps the state it already has.
+                match (&event.current_positions, &event.target_positions) {
+                    (Some(cur), Some(tgt)) => {
+                        if let Some(label) = motion_label(cur.pos1_percent(), tgt.pos1_percent()) {
+                            advise_hass_of_state_label(state, &shade_id_str, label).await?;
+                        }
+                        if let Some(label) = motion_label(cur.pos2_percent(), tgt.pos2_percent()) {
+                            let sec_id = rail_entity_id(event.id, true);
+                            advise_hass_of_state_label(state, &sec_id, label).await?;
+                        }
+                    }
+                    // No positions to compare: all we know is that it moved.
+                    _ => advise_hass_of_state_label(state, &shade_id_str, "opening").await?,
                 }
             }
             ShadeEventKind::ShadeOffline => {
@@ -1798,7 +1800,9 @@ impl ServeMqttCommand {
                     .lock()
                     .unwrap()
                     .get(&shade_id)
-                    .map(|t| t.generation == generation)
+                    .map(|t| {
+                        t.generation == generation && tokio::time::Instant::now() >= t.deadline
+                    })
                     .unwrap_or(false)
                 {
                     return;
@@ -1816,7 +1820,9 @@ impl ServeMqttCommand {
                         }
                     }
                     Err(err) => {
-                        let _ = set_shade_health(state, shade_id, false).await;
+                        // HTTP failure says nothing about the shade's radio health.
+                        // Hub availability is restored by the next successful poll.
+                        let _ = set_hub_health(state, false).await;
                         log::warn!("Motion reconciliation failed for {shade_id}: {err:#}");
                     }
                 }
@@ -1899,6 +1905,7 @@ struct SerialAndShade {
 struct MotionTask {
     abort: tokio::task::AbortHandle,
     generation: u64,
+    deadline: tokio::time::Instant,
     /// Seconds per percent of travel, derived from the hub's ETA for this
     /// move. Retains the shade's observed speed (which depends on its
     /// configured velocity) so a command that supersedes this move can
@@ -2084,9 +2091,6 @@ async fn mqtt_shade_set_position(
             // driving toward: stop animating to the stale one and start
             // animating from here to the new target.
             let superseded = state.cancel_motion(shade_id);
-            if let Some(label) = label {
-                advise_hass_of_state_label(&state, &shade_id_str, label).await?;
-            }
             retarget_interpolation(
                 &state,
                 shade_id,
@@ -2095,6 +2099,9 @@ async fn mqtt_shade_set_position(
                 current,
                 position,
             );
+            if let Some(label) = label {
+                advise_hass_of_state_label(&state, &shade_id_str, label).await?;
+            }
         }
     }
     Ok(())
@@ -2758,6 +2765,82 @@ mod tests {
             "batteryStatus": 3, "roomId": 1, "firmware": {"revision": 1, "subRevision": 0, "build": 1},
             "positions": {"primary": 0.0}, "signalStrength": -50, "bleName": "test", "shadeGroupIds": [], "serialNumber": "shade"
         })).unwrap()
+    }
+
+    fn test_command() -> ServeMqttCommand {
+        ServeMqttCommand {
+            host: None,
+            port: None,
+            username: None,
+            password: None,
+            discovery_prefix: "homeassistant".into(),
+            state_file: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_cannot_reconcile_a_move_before_its_deadline() {
+        let (state, _rx) = test_state();
+        let task = begin_interpolation(
+            &state,
+            7,
+            ShadePosition::default(),
+            ShadePosition::default(),
+            60.0,
+            0.6,
+        );
+        let generation = task.generation;
+        state.motion_tasks.lock().unwrap().insert(7, task);
+        test_command()
+            .process_event(
+                ServerEvent::ReconcileMotion {
+                    shade_id: 7,
+                    generation,
+                },
+                &state,
+            )
+            .await;
+        assert!(state.is_in_motion(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_reconciliation_does_not_permanently_mark_radio_offline() {
+        let (state, _rx) = test_state();
+        let task = begin_interpolation(
+            &state,
+            7,
+            ShadePosition::default(),
+            ShadePosition::default(),
+            0.25,
+            0.0,
+        );
+        let generation = task.generation;
+        state.motion_tasks.lock().unwrap().insert(7, task);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        test_command()
+            .process_event(
+                ServerEvent::ReconcileMotion {
+                    shade_id: 7,
+                    generation,
+                },
+                &state,
+            )
+            .await;
+        assert!(!state.offline.lock().unwrap().contains(&7));
+        assert!(!state.responding.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn top_down_reconciliation_reports_consistent_position_and_state() {
+        let (state, _rx) = test_state();
+        let mut shade = test_shade(7);
+        shade.capabilities = ShadeCapabilities::TopDown;
+        state.shades.lock().unwrap().insert(7, shade.clone());
+        let mut cache = state.published.lock().await;
+        cache.insert("pv2mqtt/shade/test/7/position".into(), "100".into());
+        cache.insert("pv2mqtt/shade/test/7/state".into(), "open".into());
+        drop(cache);
+        publish_confirmed_position(&state, &shade).await.unwrap();
     }
 
     #[tokio::test]
