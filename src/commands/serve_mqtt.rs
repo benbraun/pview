@@ -4,7 +4,6 @@ use crate::api_types::{
 };
 use crate::discovery::ResolvedHub;
 use crate::hass_helper::*;
-use crate::http_helpers::LockedError;
 use crate::hub::Hub;
 use crate::opt_env_var;
 use crate::version_info::pview_version;
@@ -147,6 +146,11 @@ impl HassRegistration {
                         tokio::time::sleep(duration).await;
                     }
                     RegEntry::Msg { topic, payload } => {
+                        let payload = if topic.ends_with("/config") && !payload.is_empty() {
+                            discovery_payload(&payload, &state.serial)?
+                        } else {
+                            payload
+                        };
                         publish_changed(state, topic, payload).await?;
                     }
                 }
@@ -629,6 +633,12 @@ async fn register_scenes(
 }
 
 async fn register_with_hass(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
+    publish_availability(
+        state,
+        format!("{MODEL}/bridge/{}/availability", state.serial),
+        true,
+    )
+    .await?;
     let mut reg = HassRegistration::new();
 
     register_hub(&state.hub.load().gateway_data, state, &mut reg)
@@ -641,6 +651,7 @@ async fn register_with_hass(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
         .await
         .context("register_scenes")?;
     reg.apply_updates(state).await.context("apply_updates")?;
+    set_hub_health(state, true).await?;
     Ok(())
 }
 
@@ -687,7 +698,16 @@ async fn publish_changed(
     state
         .client
         .load()
-        .publish(&topic, payload.as_bytes(), QoS::AtMostOnce, false)
+        .publish(
+            &topic,
+            payload.as_bytes(),
+            if topic.ends_with("/availability") {
+                QoS::AtLeastOnce
+            } else {
+                QoS::AtMostOnce
+            },
+            topic.ends_with("/availability"),
+        )
         .await?;
     published.insert(topic, payload);
     Ok(())
@@ -696,6 +716,7 @@ async fn publish_changed(
 async fn refresh_shades(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
     let revision = state.revision.load(Ordering::SeqCst);
     let shades = state.hub.load().hub.list_shades(None).await?;
+    set_hub_health(state, true).await?;
     let changed = {
         let cache = state.shades.lock().unwrap();
         cache.len() != shades.len()
@@ -745,20 +766,97 @@ async fn refresh_shades(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn advise_hass_of_unresponsive(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
-    log::info!("Marking hub status as unresponsive");
-    state.responding.store(false, Ordering::SeqCst);
+fn discovery_payload(payload: &str, serial: &str) -> anyhow::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(payload)?;
+    let entity_topic = value
+        .as_object_mut()
+        .and_then(|o| o.remove("availability_topic"));
+    let mut topics = vec![
+        format!("{MODEL}/bridge/{serial}/availability"),
+        format!("{MODEL}/hub/{serial}/availability"),
+    ];
+    if let Some(topic) = entity_topic.and_then(|v| v.as_str().map(str::to_owned)) {
+        topics.push(topic);
+    }
+    if let Some(id) = value["device"]["identifiers"][0]
+        .as_str()
+        .and_then(|id| id.strip_prefix(&format!("{serial}-")))
+        .filter(|id| id.parse::<i32>().is_ok())
+    {
+        let topic = format!("{MODEL}/shade/{serial}/{id}/availability");
+        if !topics.contains(&topic) {
+            topics.push(topic);
+        }
+    }
+    value["availability_mode"] = serde_json::json!("all");
+    value["availability"] = serde_json::json!(topics
+        .into_iter()
+        .map(|topic| serde_json::json!({"topic": topic}))
+        .collect::<Vec<_>>());
+    Ok(serde_json::to_string(&value)?)
+}
+
+async fn publish_availability(
+    state: &Arc<Pv2MqttState>,
+    topic: String,
+    online: bool,
+) -> anyhow::Result<()> {
     state
         .client
         .load()
         .publish(
-            format!("{MODEL}/sensor/{}-responding/state", state.serial),
-            "UNRESPONSIVE",
-            QoS::AtMostOnce,
-            false,
+            topic,
+            if online { "online" } else { "offline" },
+            QoS::AtLeastOnce,
+            true,
         )
         .await?;
     Ok(())
+}
+
+async fn set_hub_health(state: &Arc<Pv2MqttState>, online: bool) -> anyhow::Result<()> {
+    state.responding.store(online, Ordering::SeqCst);
+    publish_availability(
+        state,
+        format!("{MODEL}/hub/{}/availability", state.serial),
+        online,
+    )
+    .await?;
+    publish_changed(
+        state,
+        format!("{MODEL}/sensor/{}-responding/state", state.serial),
+        if online { "OK" } else { "UNRESPONSIVE" }.into(),
+    )
+    .await
+}
+
+async fn set_shade_health(
+    state: &Arc<Pv2MqttState>,
+    shade_id: i32,
+    online: bool,
+) -> anyhow::Result<()> {
+    if online {
+        state.offline.lock().unwrap().remove(&shade_id);
+    } else {
+        state.offline.lock().unwrap().insert(shade_id);
+        state.cancel_motion(shade_id);
+    }
+    for key in [
+        rail_entity_id(shade_id, false),
+        rail_entity_id(shade_id, true),
+    ] {
+        publish_availability(
+            state,
+            format!("{MODEL}/shade/{}/{key}/availability", state.serial),
+            online,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn advise_hass_of_unresponsive(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
+    set_hub_health(state, false).await
 }
 
 async fn advise_hass_of_state_label(
@@ -991,6 +1089,12 @@ impl ServeMqttCommand {
             events: tx.clone(),
         });
 
+        client.set_last_will(
+            format!("{MODEL}/bridge/{serial}/availability"),
+            "offline",
+            QoS::AtLeastOnce,
+            true,
+        )?;
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
         client.set_reconnect_delay(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY, true)?;
         client
@@ -1000,6 +1104,12 @@ impl ServeMqttCommand {
         let subscriber = client.subscriber().expect("to own the subscriber");
 
         let router = build_router(&client, &self.discovery_prefix).await?;
+        publish_availability(
+            &state,
+            format!("{MODEL}/bridge/{serial}/availability"),
+            true,
+        )
+        .await?;
         register_with_hass(&state).await?;
 
         // Periodic state update timer
@@ -1241,36 +1351,7 @@ impl ServeMqttCommand {
                 }
             }
             ShadeEventKind::ShadeOffline => {
-                state.offline.lock().unwrap().insert(event.id);
-                state
-                    .client
-                    .load()
-                    .publish(
-                        format!(
-                            "{MODEL}/shade/{serial}/{}/availability",
-                            event.id,
-                            serial = state.serial
-                        ),
-                        "offline",
-                        QoS::AtMostOnce,
-                        false,
-                    )
-                    .await?;
-                // Also mark secondary rail offline if present
-                state
-                    .client
-                    .load()
-                    .publish(
-                        format!(
-                            "{MODEL}/shade/{serial}/{}{SECONDARY_SUFFIX}/availability",
-                            event.id,
-                            serial = state.serial
-                        ),
-                        "offline",
-                        QoS::AtMostOnce,
-                        false,
-                    )
-                    .await?;
+                set_shade_health(state, event.id, false).await?;
             }
             ShadeEventKind::ShadeOnline | ShadeEventKind::BatteryAlert => {
                 if event.evt == ShadeEventKind::ShadeOnline {
@@ -1278,20 +1359,10 @@ impl ServeMqttCommand {
                 }
                 match hub.hub.shade_by_id(event.id).await {
                     Ok(shade) => {
-                        state
-                            .client
-                            .load()
-                            .publish(
-                                format!(
-                                    "{MODEL}/shade/{serial}/{}/availability",
-                                    shade.id,
-                                    serial = state.serial
-                                ),
-                                "online",
-                                QoS::AtMostOnce,
-                                false,
-                            )
-                            .await?;
+                        if event.evt == ShadeEventKind::ShadeOnline {
+                            set_shade_health(state, shade.id, true).await?;
+                        }
+                        state.shades.lock().unwrap().insert(shade.id, shade.clone());
                         advise_hass_of_updated_position(state, &shade).await?;
                         advise_hass_of_battery_level(state, &shade).await?;
                     }
@@ -1445,7 +1516,7 @@ impl ServeMqttCommand {
                         }
                     }
                     Err(err) => {
-                        state.offline.lock().unwrap().insert(shade_id);
+                        let _ = set_shade_health(state, shade_id, false).await;
                         log::warn!("Motion reconciliation failed for {shade_id}: {err:#}");
                     }
                 }
@@ -1454,28 +1525,14 @@ impl ServeMqttCommand {
                 state.published.lock().await.clear();
                 if let Err(err) = register_with_hass(state).await {
                     log::error!("Registering with HA: {err:#}");
+                    let _ = advise_hass_of_unresponsive(state).await;
                 }
             }
             ServerEvent::PeriodicStateUpdate => {
                 if let Err(err) = refresh_shades(state).await {
                     log::error!("During register_with_hass: {err:#?}");
-                    let mut unresponsive = false;
-                    for cause in err.chain() {
-                        if let Some(http_err) = cause.downcast_ref::<reqwest::Error>() {
-                            if http_err.is_connect() {
-                                unresponsive = true;
-                                break;
-                            }
-                        }
-                        if cause.downcast_ref::<LockedError>().is_some() {
-                            unresponsive = true;
-                            break;
-                        }
-                    }
-                    if unresponsive {
-                        if let Err(err) = advise_hass_of_unresponsive(&state).await {
-                            log::error!("While advising hass of unresponsive hub: {err:#}");
-                        }
+                    if let Err(err) = advise_hass_of_unresponsive(state).await {
+                        log::error!("Reporting hub availability: {err:#}");
                     }
                 }
             }
@@ -2082,6 +2139,12 @@ async fn connect_mqtt_session(
     Arc<MqttRouter<Arc<Pv2MqttState>>>,
 )> {
     let client = Client::with_auto_id()?;
+    client.set_last_will(
+        format!("{MODEL}/bridge/{}/availability", state.serial),
+        "offline",
+        QoS::AtLeastOnce,
+        true,
+    )?;
     client.set_username_and_password(
         params.mqtt_username.as_deref(),
         params.mqtt_password.as_deref(),
@@ -2257,6 +2320,22 @@ mod tests {
         state.motion_tasks.lock().unwrap().insert(1, replacement);
         assert!(!state.cancel_motion_generation(1, first));
         assert!(state.is_in_motion(1));
+    }
+
+    #[test]
+    fn discovery_requires_bridge_hub_and_entity_availability() {
+        let value = discovery_payload(r#"{"availability_topic":"pv2mqtt/shade/test/7/availability","device":{"identifiers":["test-7"]}}"#, "test").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&value).unwrap();
+        assert!(value.get("availability_topic").is_none());
+        assert_eq!(value["availability_mode"], "all");
+        let topics = value["availability"].as_array().unwrap();
+        assert_eq!(topics.len(), 3);
+        assert!(topics
+            .iter()
+            .any(|a| a["topic"] == "pv2mqtt/bridge/test/availability"));
+        assert!(topics
+            .iter()
+            .any(|a| a["topic"] == "pv2mqtt/hub/test/availability"));
     }
 
     #[test]
