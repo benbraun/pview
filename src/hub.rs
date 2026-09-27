@@ -67,11 +67,15 @@ impl SseDataParser {
 #[derive(Debug, Clone)]
 pub struct Hub {
     addr: IpAddr,
+    port: u16,
 }
 
 impl Hub {
     fn url(&self, extra: &str) -> String {
-        format!("http://{}/{extra}", self.addr)
+        format!(
+            "http://{}/{extra}",
+            std::net::SocketAddr::new(self.addr, self.port)
+        )
     }
 
     pub fn addr(&self) -> IpAddr {
@@ -105,7 +109,7 @@ impl Hub {
     }
 
     pub fn with_addr(addr: IpAddr) -> Self {
-        Self { addr }
+        Self { addr, port: 80 }
     }
 
     pub async fn discover(timeout: Duration) -> anyhow::Result<Self> {
@@ -327,8 +331,17 @@ impl Hub {
             .tcp_keepalive_interval(Duration::from_secs(15))
             .tcp_keepalive_retries(4)
             .build()?;
-        let url = format!("http://{}/home/shades/events?sse=true", self.addr);
-        let response = client.get(&url).send().await?;
+        let url = self.url("home/shades/events?sse=true");
+        let response = tokio::time::timeout(
+            Duration::from_secs(15),
+            client
+                .get(&url)
+                .header("Accept", "text/event-stream")
+                .send(),
+        )
+        .await
+        .context("SSE response headers timed out")??
+        .error_for_status()?;
         let byte_stream = response.bytes_stream();
 
         let stream = try_stream! {
@@ -359,6 +372,33 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hub_urls_support_ipv6_literals() {
+        assert_eq!(
+            Hub::with_addr("::1".parse().unwrap()).url("gateway"),
+            "http://[::1]:80/gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_rejects_http_errors_before_reading_events() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let hub = Hub {
+            addr: "127.0.0.1".parse().unwrap(),
+            port,
+        };
+        assert!(hub.shade_events_stream().await.is_err());
+        server.join().unwrap();
+    }
 
     #[test]
     fn sse_parser_yields_data_and_preserves_utf8_split_across_chunks() {

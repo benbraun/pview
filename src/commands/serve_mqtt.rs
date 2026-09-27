@@ -1046,6 +1046,21 @@ async fn advise_hass_of_battery_level(
 
 impl ServeMqttCommand {
     pub async fn run(&self, args: &crate::Args) -> anyhow::Result<()> {
+        let mut delay = RECONNECT_BASE_DELAY;
+        loop {
+            match self.run_session(args).await {
+                Ok(()) => return Ok(()),
+                Err(err) => log::error!("Bridge startup failed; retrying in {delay:?}: {err:#}"),
+            }
+            if !args.hub_ip_was_specified_by_user() {
+                *args.hub_instance.lock().await = None;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+        }
+    }
+
+    async fn run_session(&self, args: &crate::Args) -> anyhow::Result<()> {
         let mqtt_host = match &self.host {
             Some(h) => h.to_string(),
             None => std::env::var("PV_MQTT_HOST").context(
@@ -1102,6 +1117,7 @@ impl ServeMqttCommand {
             revision: AtomicU64::new(0),
             next_motion: AtomicU64::new(1),
             events: tx.clone(),
+            hub_changed: tokio::sync::watch::channel(resolved.hub.addr()).0,
         });
 
         client.set_last_will(
@@ -1112,10 +1128,13 @@ impl ServeMqttCommand {
         )?;
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
         client.set_reconnect_delay(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY, true)?;
-        client
-            .connect(&mqtt_host, mqtt_port.into(), Duration::from_secs(10), None)
-            .await
-            .with_context(|| format!("connecting to mqtt broker {mqtt_host}:{mqtt_port}"))?;
+        tokio::time::timeout(
+            MQTT_CONNECT_TIMEOUT,
+            client.connect(&mqtt_host, mqtt_port.into(), Duration::from_secs(10), None),
+        )
+        .await
+        .context("Initial MQTT connection timed out")?
+        .with_context(|| format!("connecting to mqtt broker {mqtt_host}:{mqtt_port}"))?;
         let subscriber = client.subscriber().expect("to own the subscriber");
 
         let router = build_router(&client, &self.discovery_prefix).await?;
@@ -1191,38 +1210,28 @@ impl ServeMqttCommand {
             let tx = tx.clone();
             let state = state.clone();
             tokio::spawn(async move {
-                loop {
-                    // Re-resolve on every attempt so that we follow the hub
-                    // when discovery updates its IP address.
-                    let hub = state.hub.load().hub.clone();
-                    log::info!("SSE: opening shade events stream to {}", hub.addr());
-                    match hub.shade_events_stream().await {
-                        Err(e) => {
-                            log::error!("SSE: failed to open stream: {e:#}");
-                        }
-                        Ok(stream) => {
-                            tokio::pin!(stream);
-                            while let Some(result) = stream.next().await {
-                                match result {
-                                    Ok(event) => {
-                                        if let Err(e) =
-                                            tx.send(ServerEvent::ShadeEvent(event)).await
-                                        {
-                                            log::error!("SSE: channel send error: {e:#}");
-                                            return;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("SSE: stream error: {e:#}");
-                                        break;
-                                    }
+                supervise_sessions("SSE", RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY, Duration::from_secs(60), move || {
+                    let state = state.clone();
+                    let tx = tx.clone();
+                    async move {
+                        let mut changed = state.hub_changed.subscribe();
+                        let hub = state.hub.load().hub.clone();
+                        let stream = hub.shade_events_stream().await?;
+                        tokio::pin!(stream);
+                        tx.send(ServerEvent::PeriodicStateUpdate).await?;
+                        let motions: Vec<_> = state.motion_tasks.lock().unwrap().iter().map(|(id, task)| (*id, task.generation)).collect();
+                        for (shade_id, generation) in motions { tx.send(ServerEvent::ReconcileMotion { shade_id, generation }).await?; }
+                        loop {
+                            tokio::select! {
+                                _ = changed.changed() => anyhow::bail!("hub address changed"),
+                                event = stream.next() => match event {
+                                    Some(event) => tx.send(ServerEvent::ShadeEvent(event?)).await?,
+                                    None => anyhow::bail!("SSE stream ended"),
                                 }
                             }
                         }
                     }
-                    log::info!("SSE: stream ended, reconnecting in 5s");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
+                }).await;
             });
         }
 
@@ -1420,6 +1429,7 @@ impl ServeMqttCommand {
                     hub: new_hub.hub.clone(),
                     gateway_data,
                 }));
+                state.hub_changed.send_replace(new_hub.hub.addr());
                 register_with_hass(state)
                     .await
                     .context("register_with_hass")?;
@@ -1976,6 +1986,7 @@ struct Pv2MqttState {
     revision: AtomicU64,
     next_motion: AtomicU64,
     events: tokio::sync::mpsc::Sender<ServerEvent>,
+    hub_changed: tokio::sync::watch::Sender<std::net::IpAddr>,
     /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
     velocities: std::sync::Mutex<HashMap<i32, f64>>,
     /// Last percent published per rail (keyed like the mqtt topic id, so
@@ -2305,6 +2316,7 @@ mod tests {
                 revision: AtomicU64::new(0),
                 next_motion: AtomicU64::new(1),
                 events: tx,
+                hub_changed: tokio::sync::watch::channel("127.0.0.1".parse().unwrap()).0,
             }),
             rx,
         )
