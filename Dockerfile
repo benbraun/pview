@@ -20,6 +20,8 @@ RUN adduser \
     --uid "1000" \
     "pview"
 
+RUN mkdir -p /data && chown 1000:1000 /data
+
 WORKDIR /work
 COPY . .
 
@@ -38,6 +40,8 @@ FROM scratch
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 
+COPY --from=builder --chown=1000:1000 /data /data
+
 WORKDIR /app
 
 COPY --from=builder /lib/ld-musl*.so* /lib/libssl*.so* /lib/libcrypto*.so* /usr/lib/libgcc*.so* /lib/
@@ -46,6 +50,7 @@ COPY --from=builder /root/.cargo/bin/pview ./
 USER pview:pview
 LABEL org.opencontainers.image.source="https://github.com/benbraun/pview"
 ENV \
+  PV_STATE_FILE=/data/pview-state.json \
   RUST_BACKTRACE=full \
   PATH=/app:$PATH
 

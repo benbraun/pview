@@ -1,17 +1,10 @@
 # Runtime base image; the HA builder overrides this per-arch.
 ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.21
-# Source repo and git ref (branch or tag) to build from.
-# CI pins PVIEW_REF to the release tag via scripts/apply-tag.sh.
-ARG PVIEW_REPO=https://github.com/benbraun/pview.git
-ARG PVIEW_REF=main
-
 ####################################################################################################
 ## Builder
 ####################################################################################################
 FROM --platform=$BUILDPLATFORM alpine:3.21 AS builder
 ARG TARGETPLATFORM
-ARG PVIEW_REPO
-ARG PVIEW_REF
 
 RUN case "$TARGETPLATFORM" in \
       "linux/arm/v7") echo armv7-unknown-linux-musleabihf ;; \
@@ -26,7 +19,7 @@ ENV PATH=/root/.cargo/bin:$PATH
 RUN rustup target add "$(cat /rust_target.txt)"
 
 WORKDIR /work
-RUN git clone --depth=1 --branch "$PVIEW_REF" "$PVIEW_REPO" .
+COPY . .
 
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
@@ -41,7 +34,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 ####################################################################################################
 FROM $BUILD_FROM
 
-COPY run.sh /run.sh
+COPY addon/run.sh /run.sh
 COPY --from=builder /pview /pview
 
 CMD ["/run.sh"]
