@@ -1195,10 +1195,10 @@ async fn advise_hass_of_updated_position(
     shade: &ShadeData,
 ) -> anyhow::Result<()> {
     if let Some(pct) = shade.pos1_percent() {
-        advise_hass_of_position(&state, &format!("{}", shade.id), pct).await?;
+        advise_hass_of_position(state, &format!("{}", shade.id), pct).await?;
     }
     if let Some(pct) = shade.pos2_percent() {
-        advise_hass_of_position(&state, &format!("{}{SECONDARY_SUFFIX}", shade.id), pct).await?;
+        advise_hass_of_position(state, &format!("{}{SECONDARY_SUFFIX}", shade.id), pct).await?;
     }
     if let Some(tilt) = shade.positions.tilt {
         publish_changed(
@@ -1782,12 +1782,12 @@ impl ServeMqttCommand {
                 }
             }
             ServerEvent::ShadeEvent(event, revision) => {
-                if let Err(err) = self.handle_shade_event(&state, event, revision).await {
+                if let Err(err) = self.handle_shade_event(state, event, revision).await {
                     log::error!("handling shade event: {err:#}");
                 }
             }
             ServerEvent::HubDiscovered(resolved_hub) => {
-                if let Err(err) = self.handle_discovery(&state, resolved_hub).await {
+                if let Err(err) = self.handle_discovery(state, resolved_hub).await {
                     log::error!("During handle_discovery: {err:#?}");
                 }
             }
@@ -2845,7 +2845,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_shade_event_during_put_does_not_suppress_command_watchdog() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let (state, _rx) = test_state();
         state.shades.lock().unwrap().insert(7, test_shade(7));
         state
@@ -2859,8 +2859,9 @@ mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut bytes = [0; 4096];
-            socket.read(&mut bytes).unwrap();
+            let request = crate::test_support::read_http_request(&mut socket);
+            assert!(request.starts_with("PUT /home/shades/7/positions "));
+            assert!(request.ends_with(r#"{"positions":{"primary":0.8}}"#));
             reached.send(()).unwrap();
             gate.recv().unwrap();
             socket

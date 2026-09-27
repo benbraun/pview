@@ -18,3 +18,35 @@ For each item: add behavioral regressions, run them before the change, implement
 ## Progress
 
 - Baseline: 10 tests pass after fetching locked dependencies; formatting passes.
+
+### Completed commits
+
+| Item | Commit | Outcome |
+| --- | --- | --- |
+| 1 | `8baf87c` | Independent bounded command/background queues; cached command metadata; two concurrent REST requests maximum. |
+| 2 | `082efcf` | Minute state reconciliation, 15-minute metadata checks, changed-value publication. |
+| 3 | `bfbdb29` | Motion generations, watchdogs, acknowledgement before optimistic updates. |
+| 4 | `b7e65e0` | Retained bridge LWT, hub health, symmetrical shade availability. |
+| 5 | `9d1e415` | Retained discovery/state, obsolete-topic cleanup, online-only HA birth handling. |
+| 6 | `15e4144` | Startup retries, SSE HTTP validation, backoff and address-change notification. |
+| 7 | `780b7e3` | Tilt, top-down coordinate normalization, capability-specific rail names. |
+| 8 | `e671f26` | Atomic per-hub settings, persisted discovery manifest, effective velocity validation. |
+| 9 | `0d5b19d` | Runtime diagnostic entities and explicitly estimated battery percentage. |
+| 10 | `3a1675e` | Add-on builds use checkout; standalone containers have writable persistent storage. |
+
+Independent review identified six correctness issues. Follow-up commits address all six:
+- `d9fedc7`: serialized telemetry publication, stale-registration guard and per-shade command revisions; delayed-HTTP cross-shade regression verified failing with old logic and passing with fix.
+- `acb405e`: motion deadline guards, transient REST failures affect hub rather than permanent shade radio availability, and consistent top-down settled state; each regression reproduced before repair.
+- `6f72098`: STOP displaces lower-priority queued work when saturated; regression reproduced before repair.
+
+### Validation and practical limits
+
+- TLS and no-TLS suites: 29 tests pass in each configuration.
+- Formatting and whitespace checks pass. Stable rustfmt warns that the existing `imports_granularity` option requires nightly.
+- Clippy completes with three existing warnings (`build.rs` needless borrow, `ShadeData::name` returning the decoded name, and `Args::hub_ip` cloning a Copy value). Strict `-D warnings` fails on these existing warnings.
+- Loopback HTTP fixtures consume complete requests, enforce socket deadlines, and check request paths/body.
+- Shell syntax checks pass. Docker is unavailable locally, so image construction and cross-architecture validation remain CI checks.
+- No live hub, broker or Home Assistant deployment was changed. Physical tilt/rail behavior and real outage recovery still need hardware validation.
+- Ruling: keep commands serialized and prioritize STOP over pending work; an already-sent REST command cannot safely be preempted. Under saturation STOP may discard lower-priority queued work, with a warning; an all-STOP queue remains bounded.
+- Ruling: use retained discovery and state, with explicit persisted cleanup, rather than registration sleeps. This adds retained broker state but removes subscription timing dependence.
+- Ruling: keep the feature branch local. No push, merge or deployment was requested.

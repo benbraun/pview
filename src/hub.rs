@@ -388,13 +388,13 @@ mod tests {
 
     #[tokio::test]
     async fn sse_rejects_http_errors_before_reading_events() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 4096];
-            stream.read(&mut request).unwrap();
+            let request = crate::test_support::read_http_request(&mut stream);
+            assert!(request.starts_with("GET /home/shades/events?sse=true "));
             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
         let hub = Hub {

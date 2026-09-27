@@ -11,6 +11,8 @@ mod hass_helper;
 mod http_helpers;
 mod hub;
 mod settings;
+#[cfg(test)]
+mod test_support;
 mod version_info;
 mod work_queue;
 
