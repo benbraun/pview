@@ -8,6 +8,7 @@ use crate::http_helpers::LockedError;
 use crate::hub::Hub;
 use crate::opt_env_var;
 use crate::version_info::pview_version;
+use crate::work_queue::{WorkKind, WorkQueue};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
@@ -33,7 +34,7 @@ const HARD_WIRED_LABEL: &str = "Hard Wired";
 // <https://www.home-assistant.io/integrations/cover.mqtt/>
 
 /// Launch the pv2mqtt bridge, adding your hub to Home Assistant
-#[derive(clap::Parser, Debug)]
+#[derive(clap::Parser, Debug, Clone)]
 pub struct ServeMqttCommand {
     /// The mqtt broker hostname or address.
     /// You may also set this via the PV_MQTT_HOST environment variable.
@@ -268,6 +269,7 @@ async fn register_shades(
 ) -> anyhow::Result<()> {
     let hub = state.hub.load();
     let shades = hub.hub.list_shades(None).await?;
+    *state.shades.lock().unwrap() = shades.iter().map(|s| (s.id, s.clone())).collect();
     let room_by_id: HashMap<i32, String> = hub
         .hub
         .list_rooms()
@@ -847,6 +849,7 @@ impl ServeMqttCommand {
             motion_tasks: std::sync::Mutex::new(HashMap::new()),
             velocities: std::sync::Mutex::new(HashMap::new()),
             last_published_pos: std::sync::Mutex::new(HashMap::new()),
+            shades: std::sync::Mutex::new(HashMap::new()),
         });
 
         client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
@@ -1015,6 +1018,11 @@ impl ServeMqttCommand {
     ) -> anyhow::Result<()> {
         log::debug!("SSE shade event: {event:#?}");
         let hub = state.hub.load();
+        if let Some(positions) = &event.current_positions {
+            if let Some(shade) = state.shades.lock().unwrap().get_mut(&event.id) {
+                shade.positions = positions.clone();
+            }
+        }
         match event.evt {
             ShadeEventKind::MotionStopped => {
                 // Cancel any in-progress interpolation for this shade
@@ -1198,43 +1206,91 @@ impl ServeMqttCommand {
             "Version {}. Waiting for mqtt and pv messages",
             pview_version()
         );
+        let commands = WorkQueue::new(64);
+        let background = WorkQueue::new(32);
         while let Some(msg) = rx.recv().await {
-            match msg {
-                ServerEvent::MqttMessage { msg, router } => {
-                    if let Err(err) = self.handle_mqtt_message(msg, &state, &router).await {
-                        log::error!("handling mqtt message: {err:#}");
-                    }
+            let (queue, kind) = match &msg {
+                ServerEvent::MqttMessage { msg, .. }
+                    if msg.topic != format!("{}/status", self.discovery_prefix) =>
+                {
+                    let key = msg
+                        .topic
+                        .rsplit_once('/')
+                        .map(|(base, _)| base)
+                        .unwrap_or(&msg.topic)
+                        .to_string();
+                    let kind = if msg.topic.ends_with("/command") && msg.payload == b"STOP" {
+                        WorkKind::Stop(key.trim_end_matches(SECONDARY_SUFFIX).to_string())
+                    } else if msg.topic.ends_with("/set_position")
+                        || (msg.topic.ends_with("/command")
+                            && (msg.payload == b"OPEN" || msg.payload == b"CLOSE"))
+                    {
+                        WorkKind::Replace(key)
+                    } else {
+                        WorkKind::Ordered
+                    };
+                    (&commands, kind)
                 }
-                ServerEvent::ShadeEvent(event) => {
-                    if let Err(err) = self.handle_shade_event(&state, event).await {
-                        log::error!("handling shade event: {err:#}");
-                    }
-                }
-                ServerEvent::HubDiscovered(resolved_hub) => {
-                    if let Err(err) = self.handle_discovery(&state, resolved_hub).await {
-                        log::error!("During handle_discovery: {err:#?}");
-                    }
+                ServerEvent::ShadeEvent(event)
+                    if !matches!(
+                        event.evt,
+                        ShadeEventKind::ShadeOnline | ShadeEventKind::BatteryAlert
+                    ) =>
+                {
+                    self.process_event(msg, &state).await;
+                    continue;
                 }
                 ServerEvent::PeriodicStateUpdate => {
-                    if let Err(err) = register_with_hass(&state).await {
-                        log::error!("During register_with_hass: {err:#?}");
-                        let mut unresponsive = false;
-                        for cause in err.chain() {
-                            if let Some(http_err) = cause.downcast_ref::<reqwest::Error>() {
-                                if http_err.is_connect() {
-                                    unresponsive = true;
-                                    break;
-                                }
-                            }
-                            if cause.downcast_ref::<LockedError>().is_some() {
+                    (&background, WorkKind::Replace("refresh".into()))
+                }
+                _ => (&background, WorkKind::Ordered),
+            };
+            let state = state.clone();
+            let command = self.clone();
+            if let Err(err) = queue.submit(kind, async move {
+                command.process_event(msg, &state).await;
+            }) {
+                log::error!("{err:#}");
+            }
+        }
+    }
+
+    async fn process_event(&self, msg: ServerEvent, state: &Arc<Pv2MqttState>) {
+        match msg {
+            ServerEvent::MqttMessage { msg, router } => {
+                if let Err(err) = self.handle_mqtt_message(msg, &state, &router).await {
+                    log::error!("handling mqtt message: {err:#}");
+                }
+            }
+            ServerEvent::ShadeEvent(event) => {
+                if let Err(err) = self.handle_shade_event(&state, event).await {
+                    log::error!("handling shade event: {err:#}");
+                }
+            }
+            ServerEvent::HubDiscovered(resolved_hub) => {
+                if let Err(err) = self.handle_discovery(&state, resolved_hub).await {
+                    log::error!("During handle_discovery: {err:#?}");
+                }
+            }
+            ServerEvent::PeriodicStateUpdate => {
+                if let Err(err) = register_with_hass(&state).await {
+                    log::error!("During register_with_hass: {err:#?}");
+                    let mut unresponsive = false;
+                    for cause in err.chain() {
+                        if let Some(http_err) = cause.downcast_ref::<reqwest::Error>() {
+                            if http_err.is_connect() {
                                 unresponsive = true;
                                 break;
                             }
                         }
-                        if unresponsive {
-                            if let Err(err) = advise_hass_of_unresponsive(&state).await {
-                                log::error!("While advising hass of unresponsive hub: {err:#}");
-                            }
+                        if cause.downcast_ref::<LockedError>().is_some() {
+                            unresponsive = true;
+                            break;
+                        }
+                    }
+                    if unresponsive {
+                        if let Err(err) = advise_hass_of_unresponsive(&state).await {
+                            log::error!("While advising hass of unresponsive hub: {err:#}");
                         }
                     }
                 }
@@ -1421,7 +1477,15 @@ async fn mqtt_shade_set_position(
     }
 
     let hub = state.hub.load();
-    let shade = hub.hub.shade_by_id(shade_id).await?;
+    let shade = state
+        .shades
+        .lock()
+        .unwrap()
+        .get(&shade_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Unknown shade {shade_id}; waiting for inventory refresh")
+        })?;
 
     let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
     let pos = rail_position(is_secondary, position, velocity);
@@ -1491,7 +1555,15 @@ async fn mqtt_shade_command(
     }
 
     let hub = state.hub.load();
-    let shade = hub.hub.shade_by_id(shade_id).await?;
+    let shade = state
+        .shades
+        .lock()
+        .unwrap()
+        .get(&shade_id)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Unknown shade {shade_id}; waiting for inventory refresh")
+        })?;
 
     log::info!(
         "{command} {shade_id} {} {}",
@@ -1637,6 +1709,7 @@ struct Pv2MqttState {
     first_run: AtomicBool,
     responding: AtomicBool,
     motion_tasks: std::sync::Mutex<HashMap<i32, MotionTask>>,
+    shades: std::sync::Mutex<HashMap<i32, ShadeData>>,
     /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
     velocities: std::sync::Mutex<HashMap<i32, f64>>,
     /// Last percent published per rail (keyed like the mqtt topic id, so

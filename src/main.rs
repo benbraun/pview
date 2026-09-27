@@ -11,6 +11,7 @@ mod hass_helper;
 mod http_helpers;
 mod hub;
 mod version_info;
+mod work_queue;
 
 use crate::hub::*;
 

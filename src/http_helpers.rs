@@ -24,6 +24,12 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+// Bound concurrent REST calls explicitly; runtime thread count is not an I/O limit.
+fn request_limit() -> &'static tokio::sync::Semaphore {
+    static LIMIT: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    LIMIT.get_or_init(|| tokio::sync::Semaphore::new(2))
+}
+
 pub async fn json_body<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> anyhow::Result<T> {
@@ -39,6 +45,7 @@ pub async fn json_body<T: serde::de::DeserializeOwned>(
 pub async fn get_request_with_json_response<T: reqwest::IntoUrl, R: serde::de::DeserializeOwned>(
     url: T,
 ) -> anyhow::Result<R> {
+    let _permit = request_limit().acquire().await?;
     let response = http_client()
         .request(reqwest::Method::GET, url)
         .send()
@@ -85,6 +92,7 @@ pub async fn request_with_json_response<
     url: T,
     body: &B,
 ) -> anyhow::Result<R> {
+    let _permit = request_limit().acquire().await?;
     let response = http_client().request(method, url).json(body).send().await?;
 
     let status = response.status();
