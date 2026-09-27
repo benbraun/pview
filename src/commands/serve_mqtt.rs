@@ -1,6 +1,6 @@
 use crate::api_types::{
-    GatewayConfig, PowerType, ShadeCapabilityFlags, ShadeData, ShadeEvent, ShadeEventKind,
-    ShadePosition, ShadeUpdateMotion,
+    GatewayConfig, PowerType, ShadeCapabilities, ShadeCapabilityFlags, ShadeData, ShadeEvent,
+    ShadeEventKind, ShadePosition, ShadeUpdateMotion,
 };
 use crate::discovery::ResolvedHub;
 use crate::hass_helper::*;
@@ -282,6 +282,80 @@ async fn register_hub(
     Ok(())
 }
 
+fn coordinate_percent(capabilities: ShadeCapabilities, secondary: bool, pct: u8) -> u8 {
+    if !secondary
+        && capabilities
+            .flags()
+            .contains(ShadeCapabilityFlags::PRIMARY_RAIL_REVERSED)
+    {
+        100 - pct.min(100)
+    } else {
+        pct
+    }
+}
+
+fn rail_name(capabilities: ShadeCapabilities, secondary: bool) -> Option<&'static str> {
+    if !capabilities
+        .flags()
+        .contains(ShadeCapabilityFlags::SECONDARY_RAIL)
+    {
+        return None;
+    }
+    Some(match (capabilities, secondary) {
+        (ShadeCapabilities::TopDownBottomUp, false) => "Bottom",
+        (ShadeCapabilities::TopDownBottomUp, true) => "Top",
+        (_, false) => "Primary",
+        (_, true) => "Secondary",
+    })
+}
+
+fn capability_config(
+    mut value: serde_json::Value,
+    capabilities: ShadeCapabilities,
+    secondary: bool,
+    serial: &str,
+    id: i32,
+) -> serde_json::Value {
+    let flags = capabilities.flags();
+    if !secondary && matches!(capabilities, ShadeCapabilities::TiltOnly180) {
+        for key in [
+            "command_topic",
+            "position_topic",
+            "set_position_topic",
+            "state_topic",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+    }
+    if !secondary
+        && flags
+            .intersects(ShadeCapabilityFlags::TILT_ANYWHERE | ShadeCapabilityFlags::TILT_ON_CLOSED)
+    {
+        value["tilt_command_topic"] =
+            serde_json::json!(format!("{MODEL}/shade/{serial}/{id}/tilt/set"));
+        value["tilt_status_topic"] =
+            serde_json::json!(format!("{MODEL}/shade/{serial}/{id}/tilt/state"));
+    }
+    value
+}
+
+fn reported_percent(state: &Pv2MqttState, key: &str, pct: u8) -> u8 {
+    if let Ok(address) = key.parse::<ShadeIdAddr>() {
+        if let Some(shade) = state.shades.lock().unwrap().get(&address.shade_id) {
+            return coordinate_percent(shade.capabilities, address.is_secondary, pct);
+        }
+    }
+    pct
+}
+
+fn settled_label(state: &Pv2MqttState, key: &str, pct: u8) -> &'static str {
+    if reported_percent(state, key, pct) == 0 {
+        "closed"
+    } else {
+        "open"
+    }
+}
+
 async fn register_shades(
     state: &Arc<Pv2MqttState>,
     reg: &mut HassRegistration,
@@ -315,17 +389,13 @@ async fn register_shades(
         };
         // For TDBU shades the primary rail is the bottom and the secondary is the top.
         // Give them explicit names so HA shows "Bottom" and "Top" under one device.
-        let primary_name = if has_secondary {
-            Some("Bottom".to_string())
-        } else {
-            None
-        };
+        let primary_name = rail_name(shade.capabilities, false).map(str::to_owned);
         let mut shade_ids = vec![(shade.id.to_string(), primary_name, position.pos1_percent())];
 
         if has_secondary {
             shade_ids.push((
                 format!("{}{SECONDARY_SUFFIX}", shade.id),
-                Some("Top".to_string()),
+                rail_name(shade.capabilities, true).map(str::to_owned),
                 position.pos2_percent(),
             ));
         }
@@ -374,7 +444,13 @@ async fn register_shades(
                     "{}/cover/{serial}-{shade_id}/config",
                     state.discovery_prefix
                 ),
-                serde_json::to_string(&config)?,
+                serde_json::to_string(&capability_config(
+                    serde_json::to_value(&config)?,
+                    shade.capabilities,
+                    shade_id.ends_with(SECONDARY_SUFFIX),
+                    serial,
+                    shade.id,
+                ))?,
             );
             reg.update(
                 config.base.availability_topic,
@@ -393,14 +469,21 @@ async fn register_shades(
             }) {
                 reg.update(
                     format!("{MODEL}/shade/{serial}/{shade_id}/position"),
-                    format!("{pos}"),
+                    reported_percent(state, &shade_id, pos).to_string(),
                 );
-                let state_label = if pos == 0 { "closed" } else { "open" };
+                let state_label = settled_label(state, &shade_id, pos);
                 reg.update(
                     format!("{MODEL}/shade/{serial}/{shade_id}/state"),
                     state_label,
                 );
             }
+        }
+
+        if let Some(tilt) = shade.positions.tilt {
+            reg.update(
+                format!("{MODEL}/shade/{serial}/{}/tilt/state", shade.id),
+                ShadePosition::pos_to_percent(tilt).to_string(),
+            );
         }
 
         {
@@ -758,12 +841,8 @@ async fn refresh_shades(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
                 (rail_entity_id(shade.id, true), shade.pos2_percent()),
             ] {
                 if let Some(pct) = pct {
-                    advise_hass_of_state_label(
-                        state,
-                        &key,
-                        if pct == 0 { "closed" } else { "open" },
-                    )
-                    .await?;
+                    advise_hass_of_state_label(state, &key, settled_label(state, &key, pct))
+                        .await?;
                 }
             }
         }
@@ -878,6 +957,15 @@ async fn advise_hass_of_state_label(
     shade_id: &str,
     shade_state: &str,
 ) -> anyhow::Result<()> {
+    let shade_state = if reported_percent(state, shade_id, 0) == 100 {
+        match shade_state {
+            "opening" => "closing",
+            "closing" => "opening",
+            other => other,
+        }
+    } else {
+        shade_state
+    };
     publish_changed(
         state,
         format!("{MODEL}/shade/{}/{shade_id}/state", state.serial),
@@ -895,7 +983,7 @@ async fn advise_hass_of_position(
     publish_changed(
         state,
         format!("{MODEL}/shade/{}/{shade_id}/position", state.serial),
-        position.to_string(),
+        reported_percent(state, shade_id, position).to_string(),
     )
     .await?;
     state
@@ -1006,6 +1094,14 @@ async fn advise_hass_of_updated_position(
     }
     if let Some(pct) = shade.pos2_percent() {
         advise_hass_of_position(&state, &format!("{}{SECONDARY_SUFFIX}", shade.id), pct).await?;
+    }
+    if let Some(tilt) = shade.positions.tilt {
+        publish_changed(
+            state,
+            format!("{MODEL}/shade/{}/{}/tilt/state", state.serial, shade.id),
+            ShadePosition::pos_to_percent(tilt).to_string(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1304,6 +1400,14 @@ impl ServeMqttCommand {
                 shade.positions = positions.clone();
             }
         }
+        if let Some(tilt) = event.current_positions.as_ref().and_then(|p| p.tilt) {
+            publish_changed(
+                state,
+                format!("{MODEL}/shade/{}/{}/tilt/state", state.serial, event.id),
+                ShadePosition::pos_to_percent(tilt).to_string(),
+            )
+            .await?;
+        }
         match event.evt {
             ShadeEventKind::MotionStopped => {
                 // Cancel any in-progress interpolation for this shade
@@ -1312,13 +1416,13 @@ impl ServeMqttCommand {
                     let shade_id_str = format!("{}", event.id);
                     if let Some(pct) = positions.pos1_percent() {
                         advise_hass_of_position(state, &shade_id_str, pct).await?;
-                        let shade_state = if pct == 0 { "closed" } else { "open" };
+                        let shade_state = settled_label(state, &shade_id_str, pct);
                         advise_hass_of_state_label(state, &shade_id_str, shade_state).await?;
                     }
                     if let Some(pct) = positions.pos2_percent() {
                         let sec_id = format!("{}{SECONDARY_SUFFIX}", event.id);
                         advise_hass_of_position(state, &sec_id, pct).await?;
-                        let shade_state = if pct == 0 { "closed" } else { "open" };
+                        let shade_state = settled_label(state, &sec_id, pct);
                         advise_hass_of_state_label(state, &sec_id, shade_state).await?;
                     }
                 }
@@ -1754,6 +1858,16 @@ async fn mqtt_shade_set_position(
             anyhow::anyhow!("Unknown shade {shade_id}; waiting for inventory refresh")
         })?;
 
+    anyhow::ensure!(position <= 100, "Position must be in 0..=100");
+    anyhow::ensure!(
+        shade.capabilities.flags().contains(if is_secondary {
+            ShadeCapabilityFlags::SECONDARY_RAIL
+        } else {
+            ShadeCapabilityFlags::PRIMARY_RAIL
+        }),
+        "Shade does not support this rail"
+    );
+    let position = coordinate_percent(shade.capabilities, is_secondary, position);
     let velocity = state.velocities.lock().unwrap().get(&shade_id).copied();
     let pos = rail_position(is_secondary, position, velocity);
 
@@ -1895,6 +2009,56 @@ async fn mqtt_shade_command(
             log::warn!("Command {command} has no handler");
         }
     }
+    Ok(())
+}
+
+async fn mqtt_shade_set_tilt(
+    Params(SerialAndShade {
+        serial,
+        shade_id: ShadeIdAddr {
+            shade_id,
+            is_secondary,
+        },
+    }): Params<SerialAndShade>,
+    State(state): State<Arc<Pv2MqttState>>,
+    Payload(tilt): Payload<u8>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        serial == state.serial && !is_secondary,
+        "Invalid tilt address"
+    );
+    anyhow::ensure!(tilt <= 100, "Tilt must be in 0..=100");
+    let shade = state
+        .shades
+        .lock()
+        .unwrap()
+        .get(&shade_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Unknown shade {shade_id}"))?;
+    let flags = shade.capabilities.flags();
+    anyhow::ensure!(
+        flags
+            .intersects(ShadeCapabilityFlags::TILT_ANYWHERE | ShadeCapabilityFlags::TILT_ON_CLOSED),
+        "Shade does not support tilt"
+    );
+    anyhow::ensure!(
+        !flags.contains(ShadeCapabilityFlags::TILT_ON_CLOSED)
+            || (shade.pos1_percent() == Some(0) && !state.is_in_motion(shade_id)),
+        "Close the shade before adjusting tilt"
+    );
+    state
+        .hub
+        .load()
+        .hub
+        .set_shade_position(
+            shade_id,
+            ShadePosition {
+                tilt: Some(ShadePosition::percent_to_pos(tilt)),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let _ = state.events.try_send(ServerEvent::PeriodicStateUpdate);
     Ok(())
 }
 
@@ -2152,6 +2316,12 @@ async fn build_router(
             mqtt_shade_set_velocity,
         )
         .await?;
+    router
+        .route(
+            format!("{MODEL}/shade/:serial/:shade_id/tilt/set"),
+            mqtt_shade_set_tilt,
+        )
+        .await?;
     Ok(Arc::new(router))
 }
 
@@ -2351,6 +2521,21 @@ mod tests {
         state.motion_tasks.lock().unwrap().insert(1, replacement);
         assert!(!state.cancel_motion_generation(1, first));
         assert!(state.is_in_motion(1));
+    }
+
+    #[test]
+    fn cover_capabilities_support_tilt_only_reversal_and_distinct_rail_names() {
+        use crate::api_types::ShadeCapabilities::*;
+        let config = serde_json::json!({"command_topic":"command", "position_topic":"position", "set_position_topic":"set", "state_topic":"state"});
+        let tilt = capability_config(config, TiltOnly180, false, "test", 7);
+        assert!(tilt.get("position_topic").is_none());
+        assert!(tilt.get("command_topic").is_none());
+        assert_eq!(tilt["tilt_command_topic"], "pv2mqtt/shade/test/7/tilt/set");
+        assert_eq!(rail_name(TopDownBottomUp, true), Some("Top"));
+        assert_eq!(rail_name(DualOverlapped, true), Some("Secondary"));
+        assert_eq!(coordinate_percent(TopDown, false, 25), 75);
+        assert_eq!(coordinate_percent(TopDown, false, 75), 25);
+        assert_eq!(coordinate_percent(TopDownBottomUp, true, 25), 25);
     }
 
     #[test]
