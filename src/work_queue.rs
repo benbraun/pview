@@ -70,6 +70,24 @@ impl WorkQueue {
             }
             WorkKind::Ordered => {}
         }
+        if let WorkKind::Stop(key) = &kind {
+            if let Some(job) = jobs
+                .iter_mut()
+                .find(|job| job.kind == WorkKind::Stop(key.clone()))
+            {
+                job.run = Box::pin(run);
+                return Ok(());
+            }
+            if jobs.len() >= self.capacity {
+                if let Some(index) = jobs
+                    .iter()
+                    .rposition(|job| !matches!(job.kind, WorkKind::Stop(_)))
+                {
+                    let displaced = jobs.remove(index).unwrap();
+                    log::warn!("Dropping queued {:?} to make room for STOP", displaced.kind);
+                }
+            }
+        }
         anyhow::ensure!(
             jobs.len() < self.capacity,
             "hub work queue is full; command rejected"
@@ -93,6 +111,33 @@ impl WorkQueue {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn stop_displaces_lower_priority_work_when_queue_is_full() {
+        let queue = WorkQueue::new(2);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        queue
+            .submit(WorkKind::Ordered, async move {
+                started.send(()).unwrap();
+                let _ = wait.await;
+            })
+            .unwrap();
+        ready.await.unwrap();
+        queue
+            .submit(WorkKind::Replace("other-shade".into()), async {})
+            .unwrap();
+        queue.submit(WorkKind::Ordered, async {}).unwrap();
+        let (stopped, done) = tokio::sync::oneshot::channel();
+        queue
+            .submit(WorkKind::Stop("moving-shade".into()), async move {
+                stopped.send(()).unwrap();
+            })
+            .unwrap();
+        assert_eq!(queue.jobs.lock().unwrap().len(), 2);
+        release.send(()).unwrap();
+        done.await.unwrap();
+    }
 
     #[tokio::test]
     async fn slow_work_does_not_block_enqueue_and_stop_supersedes_pending_moves() {
