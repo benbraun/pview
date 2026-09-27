@@ -9,3 +9,10 @@ services:
       - .env
     # Host networking is required for mDNS hub discovery
     network_mode: host
+    environment:
+      PV_STATE_FILE: /data/pview-state.json
+    volumes:
+      - pview-state:/data
+
+volumes:
+  pview-state:

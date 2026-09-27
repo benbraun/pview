@@ -313,3 +313,13 @@ $ pview serve-mqtt
   There is a reasonable chance that if you have shades with
   tilt or other functionality that the behavior may not be optimal.
   Please file an issue and be prepared to do grab some diagnostics via `curl`.
+
+## Persistent settings
+
+Velocity settings and the MQTT discovery manifest survive restarts. The add-on
+stores them in `/data/pview-state.json`; the supplied Compose file uses a named
+volume. Standalone runs default to `$XDG_STATE_HOME/pview/` or
+`$HOME/.local/state/pview/`, with a separate file per hub. Override with
+`PV_STATE_FILE` or `serve-mqtt --state-file`. Back up this file with the service.
+Velocity 0 uses the hub default; 1–6 is applied and displayed as 7%; invalid or
+non-finite values are rejected. Use separate state files for separate hubs.

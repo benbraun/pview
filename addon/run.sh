@@ -1,5 +1,6 @@
 #!/usr/bin/with-contenv bashio
 
+export PV_STATE_FILE=/data/pview-state.json
 export RUST_BACKTRACE=full
 export RUST_LOG_STYLE=always
 

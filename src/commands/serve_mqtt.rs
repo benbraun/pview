@@ -6,6 +6,7 @@ use crate::discovery::ResolvedHub;
 use crate::hass_helper::*;
 use crate::hub::Hub;
 use crate::opt_env_var;
+use crate::settings::{effective_velocity, StoredSettings};
 use crate::version_info::pview_version;
 use crate::work_queue::{WorkKind, WorkQueue};
 use anyhow::Context;
@@ -57,6 +58,10 @@ pub struct ServeMqttCommand {
 
     #[arg(long, default_value = "homeassistant")]
     discovery_prefix: String,
+
+    /// Persistent velocity settings and discovery manifest (or PV_STATE_FILE).
+    #[arg(long)]
+    state_file: Option<std::path::PathBuf>,
 }
 
 enum ServerEvent {
@@ -152,7 +157,15 @@ impl HassRegistration {
             let RegEntry::Msg { topic, payload } = entry;
             publish_changed(state, topic, payload).await?;
         }
-        *state.known_configs.lock().unwrap() = current;
+        {
+            let _guard = state.persistence.lock().await;
+            let changed = *state.known_configs.lock().unwrap() != current;
+            if changed {
+                let velocities = state.velocities.lock().unwrap().clone();
+                state.save_settings(velocities, current.clone()).await?;
+                *state.known_configs.lock().unwrap() = current;
+            }
+        }
         state.first_run.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -1192,6 +1205,23 @@ impl ServeMqttCommand {
         })?;
         let serial = gateway_data.serial_number.clone();
 
+        let state_file = self
+            .state_file
+            .clone()
+            .or_else(|| std::env::var_os("PV_STATE_FILE").map(Into::into))
+            .unwrap_or_else(|| {
+                let base = std::env::var_os("XDG_STATE_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|home| std::path::PathBuf::from(home).join(".local/state"))
+                    })
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                // Hex encoding keeps hub-provided serials from becoming filesystem paths.
+                let key: String = serial.bytes().map(|b| format!("{b:02x}")).collect();
+                base.join("pview").join(format!("{key}.json"))
+            });
+        let saved = StoredSettings::load(&state_file, &serial)?;
         let client = Client::with_auto_id()?;
         let state = Arc::new(Pv2MqttState {
             hub: ArcSwap::new(Arc::new(FullyResolvedHub {
@@ -1202,10 +1232,10 @@ impl ServeMqttCommand {
             serial: serial.clone(),
             discovery_prefix: self.discovery_prefix.clone(),
             first_run: AtomicBool::new(true),
-            known_configs: std::sync::Mutex::new(HashSet::new()),
+            known_configs: std::sync::Mutex::new(saved.discovery_topics),
             responding: AtomicBool::new(true),
             motion_tasks: std::sync::Mutex::new(HashMap::new()),
-            velocities: std::sync::Mutex::new(HashMap::new()),
+            velocities: std::sync::Mutex::new(saved.velocities),
             last_published_pos: std::sync::Mutex::new(HashMap::new()),
             shades: std::sync::Mutex::new(HashMap::new()),
             offline: std::sync::Mutex::new(HashSet::new()),
@@ -1213,6 +1243,8 @@ impl ServeMqttCommand {
             revision: AtomicU64::new(0),
             next_motion: AtomicU64::new(1),
             events: tx.clone(),
+            state_file: Some(state_file),
+            persistence: tokio::sync::Mutex::new(()),
             hub_changed: tokio::sync::watch::channel(resolved.hub.addr()).0,
         });
 
@@ -2082,35 +2114,34 @@ async fn mqtt_shade_set_velocity(
         return Ok(());
     }
 
-    // 0 → omit velocity from payload (hub uses default speed).
-    // 1–6 → clamp to 7 (hub ignores values below 7%).
-    let velocity = if value <= 0.0 {
-        None
-    } else {
-        Some(value.max(7.0) / 100.0)
-    };
-    match velocity {
-        Some(v) => {
-            state.velocities.lock().unwrap().insert(shade_id, v);
+    anyhow::ensure!(
+        state.shades.lock().unwrap().contains_key(&shade_id),
+        "Unknown shade {shade_id}"
+    );
+    let velocity = effective_velocity(value)?;
+    {
+        let _guard = state.persistence.lock().await;
+        let mut velocities = state.velocities.lock().unwrap().clone();
+        match velocity {
+            Some(value) => {
+                velocities.insert(shade_id, value);
+            }
+            None => {
+                velocities.remove(&shade_id);
+            }
         }
-        None => {
-            state.velocities.lock().unwrap().remove(&shade_id);
-        }
+        let configs = state.known_configs.lock().unwrap().clone();
+        state.save_settings(velocities.clone(), configs).await?;
+        *state.velocities.lock().unwrap() = velocities;
     }
+    let value = velocity.unwrap_or(0.0) * 100.0;
 
-    state
-        .client
-        .load()
-        .publish(
-            &format!(
-                "{MODEL}/shade/{serial}/{shade_id}/velocity/state",
-                serial = state.serial
-            ),
-            format!("{value:.0}").as_bytes(),
-            QoS::AtMostOnce,
-            false,
-        )
-        .await?;
+    publish_changed(
+        &state,
+        format!("{MODEL}/shade/{serial}/{shade_id}/velocity/state"),
+        format!("{value:.0}"),
+    )
+    .await?;
 
     log::info!("Set velocity for shade {shade_id} to {value:.0}%");
     Ok(())
@@ -2140,6 +2171,8 @@ struct Pv2MqttState {
     client: ArcSwap<Client>,
     serial: String,
     discovery_prefix: String,
+    state_file: Option<std::path::PathBuf>,
+    persistence: tokio::sync::Mutex<()>,
     first_run: AtomicBool,
     known_configs: std::sync::Mutex<HashSet<String>>,
     responding: AtomicBool,
@@ -2161,6 +2194,22 @@ struct Pv2MqttState {
 }
 
 impl Pv2MqttState {
+    async fn save_settings(
+        &self,
+        velocities: HashMap<i32, f64>,
+        discovery_topics: HashSet<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(path) = self.state_file.clone() {
+            let settings = StoredSettings {
+                serial: self.serial.clone(),
+                velocities,
+                discovery_topics,
+            };
+            tokio::task::spawn_blocking(move || settings.save(&path)).await??;
+        }
+        Ok(())
+    }
+
     pub fn battery_availability_topic(&self, shade: &ShadeData) -> String {
         format!(
             "{MODEL}/sensor/{}/{}/battery/availability",
@@ -2486,6 +2535,8 @@ mod tests {
                 revision: AtomicU64::new(0),
                 next_motion: AtomicU64::new(1),
                 events: tx,
+                state_file: None,
+                persistence: tokio::sync::Mutex::new(()),
                 hub_changed: tokio::sync::watch::channel("127.0.0.1".parse().unwrap()).0,
             }),
             rx,

@@ -6,10 +6,10 @@ struct TargetPosition {
     #[arg(long, conflicts_with_all = ["percent", "secondary_percent"])]
     motion: Option<ShadeUpdateMotion>,
     /// Set the primary rail position (0–100)
-    #[arg(long, group = "position")]
+    #[arg(long, group = "position", value_parser = clap::value_parser!(u8).range(0..=100))]
     percent: Option<u8>,
     /// Set the secondary (top) rail position (0–100)
-    #[arg(long, group = "position")]
+    #[arg(long, group = "position", value_parser = clap::value_parser!(u8).range(0..=100))]
     secondary_percent: Option<u8>,
 }
 
