@@ -76,7 +76,6 @@ enum ServerEvent {
 
 #[derive(Debug)]
 enum RegEntry {
-    Delay(Duration),
     Msg { topic: String, payload: String },
 }
 
@@ -105,9 +104,6 @@ impl HassRegistration {
     }
 
     pub fn delete<T: Into<String>>(&mut self, topic: T) {
-        if self.deletes.is_empty() {
-            self.deletes.push(RegEntry::Delay(Duration::from_secs(4)));
-        }
         self.deletes.push(RegEntry::msg(topic, ""));
     }
 
@@ -119,46 +115,64 @@ impl HassRegistration {
         self.updates.push(RegEntry::msg(topic, payload));
     }
 
-    pub async fn apply_updates(mut self, state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
-        let is_first_run = state.first_run.load(Ordering::SeqCst);
-
-        if is_first_run {
-            if !self.configs.is_empty() && !self.updates.is_empty() {
-                // Delay between registering configs and advising hass
-                // of the states, so that hass has had enough time
-                // to subscribe to the correct topics
-                let delay = self.configs.len() as u64 * 30;
-                log::info!(
-                    "there are {} configs, and {} updates. delay ms = {delay}",
-                    self.configs.len(),
-                    self.updates.len()
-                );
-                self.updates
-                    .insert(0, RegEntry::Delay(Duration::from_millis(delay)));
-            }
+    pub async fn apply_updates(self, state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
+        let current: HashSet<String> = self
+            .configs
+            .iter()
+            .map(|entry| {
+                let RegEntry::Msg { topic, .. } = entry;
+                topic.clone()
+            })
+            .collect();
+        let legacy = if state.first_run.load(Ordering::SeqCst) {
+            self.deletes
+                .into_iter()
+                .map(|entry| {
+                    let RegEntry::Msg { topic, .. } = entry;
+                    topic
+                })
+                .collect()
         } else {
-            self.deletes.clear();
+            vec![]
+        };
+        let removed = obsolete_configs(&state.known_configs.lock().unwrap(), &current, legacy);
+        for topic in removed {
+            state
+                .client
+                .load()
+                .publish(&topic, b"", QoS::AtLeastOnce, true)
+                .await?;
+            state.published.lock().await.remove(&topic);
         }
-        for queue in [self.deletes, self.configs, self.updates] {
-            for entry in queue {
-                match entry {
-                    RegEntry::Delay(duration) => {
-                        tokio::time::sleep(duration).await;
-                    }
-                    RegEntry::Msg { topic, payload } => {
-                        let payload = if topic.ends_with("/config") && !payload.is_empty() {
-                            discovery_payload(&payload, &state.serial)?
-                        } else {
-                            payload
-                        };
-                        publish_changed(state, topic, payload).await?;
-                    }
-                }
-            }
+        for entry in self.configs {
+            let RegEntry::Msg { topic, payload } = entry;
+            publish_changed(state, topic, discovery_payload(&payload, &state.serial)?).await?;
         }
+        for entry in self.updates {
+            let RegEntry::Msg { topic, payload } = entry;
+            publish_changed(state, topic, payload).await?;
+        }
+        *state.known_configs.lock().unwrap() = current;
         state.first_run.store(false, Ordering::SeqCst);
         Ok(())
     }
+}
+
+fn obsolete_configs(
+    previous: &HashSet<String>,
+    current: &HashSet<String>,
+    legacy: Vec<String>,
+) -> HashSet<String> {
+    previous
+        .iter()
+        .cloned()
+        .chain(legacy)
+        .filter(|topic| !current.contains(topic))
+        .collect()
+}
+
+fn is_ha_birth(status: &str) -> bool {
+    status == "online"
 }
 
 struct DiagnosticEntity {
@@ -701,12 +715,12 @@ async fn publish_changed(
         .publish(
             &topic,
             payload.as_bytes(),
-            if topic.ends_with("/availability") {
+            if topic.ends_with("/availability") || topic.ends_with("/config") {
                 QoS::AtLeastOnce
             } else {
                 QoS::AtMostOnce
             },
-            topic.ends_with("/availability"),
+            true,
         )
         .await?;
     published.insert(topic, payload);
@@ -1077,6 +1091,7 @@ impl ServeMqttCommand {
             serial: serial.clone(),
             discovery_prefix: self.discovery_prefix.clone(),
             first_run: AtomicBool::new(true),
+            known_configs: std::sync::Mutex::new(HashSet::new()),
             responding: AtomicBool::new(true),
             motion_tasks: std::sync::Mutex::new(HashMap::new()),
             velocities: std::sync::Mutex::new(HashMap::new()),
@@ -1932,8 +1947,10 @@ async fn mqtt_homeassitant_status(
     State(state): State<Arc<Pv2MqttState>>,
 ) -> anyhow::Result<()> {
     log::info!("Home Assistant status changed: {status}",);
-    // Make apply_updates be more thorough
-    state.first_run.store(true, Ordering::SeqCst);
+    if !is_ha_birth(&status) {
+        return Ok(());
+    }
+    state.published.lock().await.clear();
     register_with_hass(&state).await
 }
 
@@ -1950,6 +1967,7 @@ struct Pv2MqttState {
     serial: String,
     discovery_prefix: String,
     first_run: AtomicBool,
+    known_configs: std::sync::Mutex<HashSet<String>>,
     responding: AtomicBool,
     motion_tasks: std::sync::Mutex<HashMap<i32, MotionTask>>,
     shades: std::sync::Mutex<HashMap<i32, ShadeData>>,
@@ -2276,6 +2294,7 @@ mod tests {
                 serial: "test".into(),
                 discovery_prefix: "homeassistant".into(),
                 first_run: AtomicBool::new(true),
+                known_configs: std::sync::Mutex::new(HashSet::new()),
                 responding: AtomicBool::new(true),
                 motion_tasks: std::sync::Mutex::new(HashMap::new()),
                 velocities: std::sync::Mutex::new(HashMap::new()),
@@ -2320,6 +2339,20 @@ mod tests {
         state.motion_tasks.lock().unwrap().insert(1, replacement);
         assert!(!state.cancel_motion_generation(1, first));
         assert!(state.is_in_motion(1));
+    }
+
+    #[test]
+    fn discovery_deletes_only_obsolete_topics_and_birth_ignores_offline() {
+        let old = HashSet::from(["old".to_string(), "current".to_string()]);
+        let new = HashSet::from(["current".to_string()]);
+        let legacy = vec!["legacy".to_string(), "current".to_string()];
+        assert_eq!(
+            obsolete_configs(&old, &new, legacy),
+            HashSet::from(["old".to_string(), "legacy".to_string()])
+        );
+        assert!(is_ha_birth("online"));
+        assert!(!is_ha_birth("offline"));
+        assert!(!is_ha_birth("unexpected"));
     }
 
     #[test]
