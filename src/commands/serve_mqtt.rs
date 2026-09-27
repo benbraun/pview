@@ -70,7 +70,7 @@ enum ServerEvent {
         msg: Message,
         received: std::time::Instant,
     },
-    ShadeEvent(ShadeEvent),
+    ShadeEvent(ShadeEvent, u64),
     PeriodicStateUpdate,
     Register,
     Diagnostics,
@@ -96,6 +96,7 @@ impl RegEntry {
 }
 
 struct HassRegistration {
+    snapshot_revision: u64,
     deletes: Vec<RegEntry>,
     configs: Vec<RegEntry>,
     updates: Vec<RegEntry>,
@@ -104,6 +105,7 @@ struct HassRegistration {
 impl HassRegistration {
     pub fn new() -> Self {
         Self {
+            snapshot_revision: 0,
             deletes: vec![],
             configs: vec![],
             updates: vec![],
@@ -155,10 +157,18 @@ impl HassRegistration {
             let RegEntry::Msg { topic, payload } = entry;
             publish_changed(state, topic, discovery_payload(&payload, &state.serial)?).await?;
         }
-        for entry in self.updates {
-            let RegEntry::Msg { topic, payload } = entry;
-            publish_changed(state, topic, payload).await?;
+        {
+            // Keep the freshness check and all state publications indivisible with
+            // respect to SSE, interpolation and command acknowledgements.
+            let _guard = state.telemetry.lock().await;
+            if self.snapshot_revision == state.revision.load(Ordering::SeqCst) {
+                for entry in self.updates {
+                    let RegEntry::Msg { topic, payload } = entry;
+                    publish_changed(state, topic, payload).await?;
+                }
+            }
         }
+
         {
             let _guard = state.persistence.lock().await;
             let changed = *state.known_configs.lock().unwrap() != current;
@@ -809,6 +819,7 @@ async fn register_with_hass(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
     )
     .await?;
     let mut reg = HassRegistration::new();
+    reg.snapshot_revision = state.revision.load(Ordering::SeqCst);
 
     register_hub(&state.hub.load().gateway_data, state, &mut reg)
         .await
@@ -896,10 +907,11 @@ async fn refresh_shades(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
                     != Some(inventory_signature(serde_json::to_value(shade).unwrap()))
             })
     };
-    cache_snapshot(state, &shades, revision);
     if changed {
         return register_with_hass(state).await;
     }
+    let _guard = state.telemetry.lock().await;
+    cache_snapshot(state, &shades, revision);
     for shade in shades {
         if snapshot_is_current(
             state.is_in_motion(shade.id),
@@ -1114,6 +1126,17 @@ fn spawn_position_interpolation(
         let mut last_secondary = None;
         loop {
             tokio::time::sleep(INTERPOLATION_TICK).await;
+            let _guard = state.telemetry.lock().await;
+            if state
+                .motion_tasks
+                .lock()
+                .unwrap()
+                .get(&shade_id)
+                .map(|task| task.generation)
+                != Some(generation)
+            {
+                return;
+            }
             let elapsed = start_time.elapsed();
             let t = elapsed.as_secs_f64() / eta_secs;
             if let (Some(s), Some(tgt)) = (start.pos1_percent(), target.pos1_percent()) {
@@ -1307,6 +1330,8 @@ impl ServeMqttCommand {
             offline: std::sync::Mutex::new(HashSet::new()),
             published: tokio::sync::Mutex::new(HashMap::new()),
             revision: AtomicU64::new(0),
+            shade_revisions: std::sync::Mutex::new(HashMap::new()),
+            telemetry: tokio::sync::Mutex::new(()),
             next_motion: AtomicU64::new(1),
             events: tx.clone(),
             sse_connected: AtomicBool::new(false),
@@ -1427,7 +1452,7 @@ impl ServeMqttCommand {
                             tokio::select! {
                                 _ = changed.changed() => anyhow::bail!("hub address changed"),
                                 event = stream.next() => match event {
-                                    Some(event) => tx.send(ServerEvent::ShadeEvent(event?)).await?,
+                                    Some(event) => tx.send(ServerEvent::ShadeEvent(event?, 0)).await?,
                                     None => anyhow::bail!("SSE stream ended"),
                                 }
                             }
@@ -1502,10 +1527,24 @@ impl ServeMqttCommand {
         &self,
         state: &Arc<Pv2MqttState>,
         event: ShadeEvent,
+        revision: u64,
     ) -> anyhow::Result<()> {
         log::debug!("SSE shade event: {event:#?}");
-        state.revision.fetch_add(1, Ordering::SeqCst);
         let hub = state.hub.load();
+        // HTTP happens outside the telemetry gate so an online/battery refresh
+        // cannot stall STOP or live motion events.
+        let fetched = if matches!(
+            event.evt,
+            ShadeEventKind::ShadeOnline | ShadeEventKind::BatteryAlert
+        ) {
+            Some(hub.hub.shade_by_id(event.id).await)
+        } else {
+            None
+        };
+        let _guard = state.telemetry.lock().await;
+        if state.shade_revision(event.id) != revision {
+            return Ok(());
+        }
         if let Some(positions) = &event.current_positions {
             if let Some(shade) = state.shades.lock().unwrap().get_mut(&event.id) {
                 shade.positions = positions.clone();
@@ -1596,7 +1635,7 @@ impl ServeMqttCommand {
                 if event.evt == ShadeEventKind::ShadeOnline {
                     state.offline.lock().unwrap().remove(&event.id);
                 }
-                match hub.hub.shade_by_id(event.id).await {
+                match fetched.expect("online and battery events fetch a shade") {
                     Ok(shade) => {
                         if event.evt == ShadeEventKind::ShadeOnline {
                             set_shade_health(state, shade.id, true).await?;
@@ -1666,7 +1705,11 @@ impl ServeMqttCommand {
         );
         let commands = WorkQueue::new(64);
         let background = WorkQueue::new(32);
-        while let Some(msg) = rx.recv().await {
+        while let Some(mut msg) = rx.recv().await {
+            if let ServerEvent::ShadeEvent(event, revision) = &mut msg {
+                let _guard = state.telemetry.lock().await;
+                *revision = state.mark_shade_event(event.id);
+            }
             let (queue, kind) = match &msg {
                 ServerEvent::MqttMessage { msg, .. }
                     if msg.topic != format!("{}/status", self.discovery_prefix) =>
@@ -1689,7 +1732,7 @@ impl ServeMqttCommand {
                     };
                     (&commands, kind)
                 }
-                ServerEvent::ShadeEvent(event)
+                ServerEvent::ShadeEvent(event, _)
                     if !matches!(
                         event.evt,
                         ShadeEventKind::ShadeOnline | ShadeEventKind::BatteryAlert
@@ -1736,8 +1779,8 @@ impl ServeMqttCommand {
                     log::error!("handling mqtt message: {err:#}");
                 }
             }
-            ServerEvent::ShadeEvent(event) => {
-                if let Err(err) = self.handle_shade_event(&state, event).await {
+            ServerEvent::ShadeEvent(event, revision) => {
+                if let Err(err) = self.handle_shade_event(&state, event, revision).await {
                     log::error!("handling shade event: {err:#}");
                 }
             }
@@ -1761,6 +1804,7 @@ impl ServeMqttCommand {
                     return;
                 }
                 let result = state.hub.load().hub.shade_by_id(shade_id).await;
+                let _guard = state.telemetry.lock().await;
                 if !state.cancel_motion_generation(shade_id, generation) {
                     return;
                 }
@@ -1977,6 +2021,7 @@ async fn mqtt_shade_set_position(
         return Ok(());
     }
 
+    let planning_guard = state.telemetry.lock().await;
     let hub = state.hub.load();
     let shade = state
         .shades
@@ -2016,14 +2061,17 @@ async fn mqtt_shade_set_position(
     if plan_position_command(position, current, in_motion) == PositionCommandPlan::Skip {
         return Ok(());
     }
-    let revision = state.revision.load(Ordering::SeqCst);
+    let revision = state.shade_revision(shade_id);
+    drop(planning_guard);
     if let Err(err) = hub.hub.set_shade_position(shade_id, pos).await {
         let _ = state.events.try_send(ServerEvent::PeriodicStateUpdate);
         return Err(err);
     }
-    if state.revision.load(Ordering::SeqCst) != revision {
+    let _guard = state.telemetry.lock().await;
+    if state.shade_revision(shade_id) != revision {
         return Ok(());
     }
+    state.mark_shade_event(shade_id);
     match plan_position_command(position, current, in_motion) {
         PositionCommandPlan::Skip => {
             log::info!(
@@ -2115,11 +2163,13 @@ async fn mqtt_shade_command(
             // the old target is now wrong, and there is no new target to
             // animate toward. MotionStopped reports where it actually
             // ended up.
-            let revision = state.revision.load(Ordering::SeqCst);
+            let revision = state.shade_revision(shade_id);
             hub.hub
                 .move_shade(shade_id, ShadeUpdateMotion::Stop)
                 .await?;
-            if state.revision.load(Ordering::SeqCst) == revision {
+            let _guard = state.telemetry.lock().await;
+            if state.shade_revision(shade_id) == revision {
+                state.mark_shade_event(shade_id);
                 state.cancel_motion(shade_id);
                 let task = begin_interpolation(
                     &state,
@@ -2279,6 +2329,8 @@ struct Pv2MqttState {
     offline: std::sync::Mutex<HashSet<i32>>,
     published: tokio::sync::Mutex<HashMap<String, String>>,
     revision: AtomicU64,
+    shade_revisions: std::sync::Mutex<HashMap<i32, u64>>,
+    telemetry: tokio::sync::Mutex<()>,
     next_motion: AtomicU64,
     events: tokio::sync::mpsc::Sender<ServerEvent>,
     sse_connected: AtomicBool,
@@ -2297,6 +2349,18 @@ struct Pv2MqttState {
 }
 
 impl Pv2MqttState {
+    fn shade_revision(&self, id: i32) -> u64 {
+        *self.shade_revisions.lock().unwrap().get(&id).unwrap_or(&0)
+    }
+
+    fn mark_shade_event(&self, id: i32) -> u64 {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        let mut revisions = self.shade_revisions.lock().unwrap();
+        let value = revisions.entry(id).or_default();
+        *value += 1;
+        *value
+    }
+
     async fn save_settings(
         &self,
         velocities: HashMap<i32, f64>,
@@ -2640,6 +2704,8 @@ mod tests {
                 offline: std::sync::Mutex::new(HashSet::new()),
                 published: tokio::sync::Mutex::new(HashMap::new()),
                 revision: AtomicU64::new(0),
+                shade_revisions: std::sync::Mutex::new(HashMap::new()),
+                telemetry: tokio::sync::Mutex::new(()),
                 next_motion: AtomicU64::new(1),
                 events: tx,
                 sse_connected: AtomicBool::new(false),
@@ -2684,6 +2750,88 @@ mod tests {
         state.motion_tasks.lock().unwrap().insert(1, replacement);
         assert!(!state.cancel_motion_generation(1, first));
         assert!(state.is_in_motion(1));
+    }
+
+    fn test_shade(id: i32) -> ShadeData {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "type": 1, "ptName": "Test", "name": "VGVzdA==", "capabilities": 0, "powerType": 0,
+            "batteryStatus": 3, "roomId": 1, "firmware": {"revision": 1, "subRevision": 0, "build": 1},
+            "positions": {"primary": 0.0}, "signalStrength": -50, "bleName": "test", "shadeGroupIds": [], "serialNumber": "shade"
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unrelated_shade_event_during_put_does_not_suppress_command_watchdog() {
+        use std::io::{Read, Write};
+        let (state, _rx) = test_state();
+        state.shades.lock().unwrap().insert(7, test_shade(7));
+        state
+            .published
+            .lock()
+            .await
+            .insert("pv2mqtt/shade/test/7/state".into(), "opening".into());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            socket.read(&mut bytes).unwrap();
+            reached.send(()).unwrap();
+            gate.recv().unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        state.hub.store(Arc::new(FullyResolvedHub {
+            hub: Hub::with_port("127.0.0.1".parse().unwrap(), port),
+            gateway_data: state.hub.load().gateway_data.clone(),
+        }));
+        let worker_state = state.clone();
+        let command = tokio::spawn(async move {
+            mqtt_shade_set_position(
+                Params(SerialAndShade {
+                    serial: "test".into(),
+                    shade_id: ShadeIdAddr {
+                        shade_id: 7,
+                        is_secondary: false,
+                    },
+                }),
+                Topic("test".into()),
+                State(worker_state),
+                Payload(80),
+            )
+            .await
+        });
+        wait.await.unwrap();
+        state.mark_shade_event(8);
+        release.send(()).unwrap();
+        command.await.unwrap().unwrap();
+        assert!(
+            state.is_in_motion(7),
+            "shade 8 must not suppress shade 7 recovery"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_registration_cannot_overwrite_newer_sse_state() {
+        let (state, _rx) = test_state();
+        let mut reg = HassRegistration::new();
+        reg.update("pv2mqtt/shade/test/7/position", "0");
+        state
+            .published
+            .lock()
+            .await
+            .insert("pv2mqtt/shade/test/7/position".into(), "80".into());
+        state.revision.fetch_add(1, Ordering::SeqCst);
+        // An offline MQTT client makes any attempted stale publish fail.
+        reg.apply_updates(&state).await.unwrap();
+        assert_eq!(
+            state.published.lock().await["pv2mqtt/shade/test/7/position"],
+            "80"
+        );
     }
 
     #[tokio::test]

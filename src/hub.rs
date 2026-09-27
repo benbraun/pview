@@ -112,6 +112,11 @@ impl Hub {
         Self { addr, port: 80 }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_port(addr: IpAddr, port: u16) -> Self {
+        Self { addr, port }
+    }
+
     pub async fn discover(timeout: Duration) -> anyhow::Result<Self> {
         let addr = resolve_hub(timeout).await.context(
             "Failed to discover the PowerView Hub. \
