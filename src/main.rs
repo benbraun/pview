@@ -10,6 +10,7 @@ mod discovery;
 mod hass_helper;
 mod http_helpers;
 mod hub;
+mod mqtt;
 mod settings;
 #[cfg(test)]
 mod test_support;

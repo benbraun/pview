@@ -13,10 +13,12 @@ cargo clippy --all-targets   # lint; keep it warning-free
 cargo fmt                    # format code
 ```
 
-The default `mqtt-tls` feature compiles the vendored libmosquitto 2.0.9, which
-does not build against OpenSSL 4 (opaque `ASN1_STRING`). On a Mac with Homebrew
-`openssl@4`, set `OPENSSL_DIR=$(brew --prefix openssl@3)`, or build with
-`--no-default-features --features mqtt-no-tls`. Alpine 3.24 ships OpenSSL 3.5.
+There is no C code to build: MQTT is rumqttc without TLS (pview has never
+connected to the broker over TLS). The `mqtt-tls` and `mqtt-no-tls` features are
+empty and exist only so old build commands keep working.
+
+The `serve_mqtt` tests run a real broker (rumqttd, a dev-dependency) in-process,
+behind a TCP proxy they can cut, and a loopback fake hub.
 
 Run a single command against a local hub:
 ```bash
@@ -42,7 +44,8 @@ CLI args (`main.rs`) → `Args::hub()` resolves the hub (mDNS via `discovery.rs`
 - **`hub.rs`** — `Hub` struct; one public method per API operation. Shade positions are normalised `0.0–1.0` floats in the API; `ShadePosition::pos_to_percent`/`percent_to_pos` convert to/from 0–100.
 - **`discovery.rs`** — mDNS discovery using service name `_PowerView-G3._tcp.local`. Hub resolves to a `ResolvedHub` carrying the IP.
 - **`hass_helper.rs`** — Typed serde structs for Home Assistant MQTT discovery payloads (covers, sensors, buttons, scenes).
-- **`commands/serve_mqtt.rs`** — The main long-running service. Uses `mosquitto-rs` with a topic router. Maintains an SSE connection to `home/shades/events` and drives position interpolation tasks (per-shade `AbortHandle` stored in `Pv2MqttState.motion_tasks`).
+- **`mqtt.rs`** — The MQTT layer over rumqttc: a `Client` that fails fast while disconnected (callers then re-send after the reconnect re-registration) and an `MqttRouter` whose handlers take `Topic`/`Payload`/`Params`/`State` extractors.
+- **`commands/serve_mqtt.rs`** — The main long-running service. One task polls the rumqttc `EventLoop` (`mqtt_event_pump`); it must be running before anything is published, because rumqttc only sends what the poller pulls off its request queue. Polling after an error reconnects; on CONNACK the pump resubscribes (clean session) and asks the serve loop to re-register. Maintains an SSE connection to `home/shades/events` and drives position interpolation tasks (per-shade `AbortHandle` stored in `Pv2MqttState.motion_tasks`).
 
 ### Shade naming
 

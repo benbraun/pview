@@ -5,6 +5,7 @@ use crate::api_types::{
 use crate::discovery::ResolvedHub;
 use crate::hass_helper::*;
 use crate::hub::Hub;
+use crate::mqtt::{parse_deser, Client, Message, MqttRouter, Params, Payload, QoS, State, Topic};
 use crate::opt_env_var;
 use crate::settings::{effective_velocity, StoredSettings};
 use crate::version_info::pview_version;
@@ -12,8 +13,7 @@ use crate::work_queue::{WorkKind, WorkQueue};
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
-use mosquitto_rs::router::*;
-use mosquitto_rs::*;
+use rumqttc::{AsyncClient, Event, EventLoop, LastWill, MqttOptions, Packet, SubscribeReasonCode};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -1356,7 +1356,14 @@ impl ServeMqttCommand {
                 base.join("pview").join(format!("{key}.json"))
             });
         let saved = StoredSettings::load(&state_file, &serial)?;
-        let client = Client::with_auto_id()?;
+        let session_params = MqttSessionParams {
+            mqtt_host,
+            mqtt_port,
+            mqtt_username,
+            mqtt_password,
+        };
+        let session = open_mqtt_session(&session_params, &serial, &self.discovery_prefix).await?;
+        let client = session.client.clone();
         let state = Arc::new(Pv2MqttState {
             hub: ArcSwap::new(Arc::new(FullyResolvedHub {
                 hub: resolved.hub.clone(),
@@ -1389,24 +1396,41 @@ impl ServeMqttCommand {
             hub_changed: tokio::sync::watch::channel(resolved.hub.addr()).0,
         });
 
-        client.set_last_will(
-            format!("{MODEL}/bridge/{serial}/availability"),
-            "offline",
-            QoS::AtLeastOnce,
-            true,
-        )?;
-        client.set_username_and_password(mqtt_username.as_deref(), mqtt_password.as_deref())?;
-        client.set_reconnect_delay(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY, true)?;
-        tokio::time::timeout(
-            MQTT_CONNECT_TIMEOUT,
-            client.connect(&mqtt_host, mqtt_port.into(), Duration::from_secs(10), None),
-        )
-        .await
-        .context("Initial MQTT connection timed out")?
-        .with_context(|| format!("connecting to mqtt broker {mqtt_host}:{mqtt_port}"))?;
-        let subscriber = client.subscriber().expect("to own the subscriber");
+        // The event loop must be running before anything is published:
+        // rumqttc only sends what its poller pulls off the request queue.
+        {
+            let state = state.clone();
+            let tx = tx.clone();
+            let discovery_prefix = self.discovery_prefix.to_string();
+            let initial = std::sync::Mutex::new(Some(session));
+            tokio::spawn(async move {
+                supervise_sessions(
+                    "mqtt",
+                    RECONNECT_BASE_DELAY,
+                    RECONNECT_MAX_DELAY,
+                    Duration::from_secs(60),
+                    move || {
+                        let state = state.clone();
+                        let tx = tx.clone();
+                        let discovery_prefix = discovery_prefix.clone();
+                        let params = session_params.clone();
+                        let initial = initial.lock().unwrap().take();
+                        async move {
+                            let session = match initial {
+                                Some(session) => session,
+                                None => {
+                                    reopen_mqtt_session(&params, &state, &tx, &discovery_prefix)
+                                        .await?
+                                }
+                            };
+                            mqtt_event_pump(session, tx, state).await
+                        }
+                    },
+                )
+                .await;
+            });
+        }
 
-        let router = build_router(&client, &self.discovery_prefix).await?;
         publish_availability(
             &state,
             format!("{MODEL}/bridge/{serial}/availability"),
@@ -1511,49 +1535,6 @@ impl ServeMqttCommand {
             });
         }
 
-        // Supervised MQTT event loop. Any way the session can die — the
-        // client permanently disconnecting, the subscriber channel closing,
-        // or a failed resubscribe after reconnect — tears down the session;
-        // the supervisor then builds a fresh client and carries on.
-        {
-            let state = state.clone();
-            let discovery_prefix = self.discovery_prefix.to_string();
-            let initial = std::sync::Mutex::new(Some((client, subscriber, router)));
-            let session_params = MqttSessionParams {
-                mqtt_host,
-                mqtt_port,
-                mqtt_username,
-                mqtt_password,
-            };
-            tokio::spawn(async move {
-                supervise_sessions(
-                    "mqtt",
-                    RECONNECT_BASE_DELAY,
-                    RECONNECT_MAX_DELAY,
-                    Duration::from_secs(60),
-                    move || {
-                        let state = state.clone();
-                        let tx = tx.clone();
-                        let discovery_prefix = discovery_prefix.clone();
-                        let params = session_params.clone();
-                        let initial = initial.lock().unwrap().take();
-                        async move {
-                            let (client, subscriber, router) = match initial {
-                                Some(session) => session,
-                                None => {
-                                    connect_mqtt_session(&params, &state, &tx, &discovery_prefix)
-                                        .await?
-                                }
-                            };
-                            mqtt_event_pump(client, subscriber, router, tx, discovery_prefix, state)
-                                .await
-                        }
-                    },
-                )
-                .await;
-            });
-        }
-
         self.serve(rx, state).await;
         Ok(())
     }
@@ -1565,7 +1546,7 @@ impl ServeMqttCommand {
         router: &MqttRouter<Arc<Pv2MqttState>>,
     ) -> anyhow::Result<()> {
         log::debug!("msg: {msg:?}");
-        Ok(router.dispatch(msg, Arc::clone(state)).await?)
+        router.dispatch(msg, Arc::clone(state)).await
     }
 
     async fn handle_shade_event(
@@ -2531,6 +2512,10 @@ fn current_estimate(
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const MQTT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const MQTT_KEEP_ALIVE: Duration = Duration::from_secs(10);
+const MQTT_MAX_PACKET: usize = 1024 * 1024;
+/// Room for a full re-registration burst (hundreds of retained topics).
+const MQTT_REQUEST_CAPACITY: usize = 1024;
 /// How often a moving shade's interpolated position is recomputed.
 /// 100ms captures nearly every integer percent step of typical shade
 /// travel, which is as smooth as HA's integer position model allows.
@@ -2544,149 +2529,192 @@ struct MqttSessionParams {
     mqtt_password: Option<String>,
 }
 
-/// Subscribes to the topics we serve and returns the router for them.
-/// Deliberately does not talk to the hub: a slow or unresponsive hub
-/// must not be able to fail MQTT (re)connection.
-async fn build_router(
-    client: &Client,
-    discovery_prefix: &str,
-) -> anyhow::Result<Arc<MqttRouter<Arc<Pv2MqttState>>>> {
-    let mut router: MqttRouter<Arc<Pv2MqttState>> = MqttRouter::new(client.clone());
-    router
-        .route(
-            format!("{discovery_prefix}/status"),
-            mqtt_homeassitant_status,
-        )
-        .await?;
-    router
-        .route(
-            format!("{MODEL}/scene/:serial/:scene_id/set"),
-            mqtt_scene_activate,
-        )
-        .await?;
-    router
-        .route(
-            format!("{MODEL}/shade/:serial/:shade_id/set_position"),
-            mqtt_shade_set_position,
-        )
-        .await?;
-    router
-        .route(
-            format!("{MODEL}/shade/:serial/:shade_id/command"),
-            mqtt_shade_command,
-        )
-        .await?;
-    router
-        .route(
-            format!("{MODEL}/shade/:serial/:shade_id/velocity/set"),
-            mqtt_shade_set_velocity,
-        )
-        .await?;
-    router
-        .route(
-            format!("{MODEL}/shade/:serial/:shade_id/tilt/set"),
-            mqtt_shade_set_tilt,
-        )
-        .await?;
-    Ok(Arc::new(router))
+/// The topics we serve. Deliberately does not talk to the hub: a slow or
+/// unresponsive hub must not be able to fail MQTT (re)connection.
+fn build_router(discovery_prefix: &str) -> Arc<MqttRouter<Arc<Pv2MqttState>>> {
+    let mut router = MqttRouter::new();
+    router.route(
+        format!("{discovery_prefix}/status"),
+        mqtt_homeassitant_status,
+    );
+    router.route(
+        format!("{MODEL}/scene/:serial/:scene_id/set"),
+        mqtt_scene_activate,
+    );
+    router.route(
+        format!("{MODEL}/shade/:serial/:shade_id/set_position"),
+        mqtt_shade_set_position,
+    );
+    router.route(
+        format!("{MODEL}/shade/:serial/:shade_id/command"),
+        mqtt_shade_command,
+    );
+    router.route(
+        format!("{MODEL}/shade/:serial/:shade_id/velocity/set"),
+        mqtt_shade_set_velocity,
+    );
+    router.route(
+        format!("{MODEL}/shade/:serial/:shade_id/tilt/set"),
+        mqtt_shade_set_tilt,
+    );
+    Arc::new(router)
 }
 
-/// Builds a fresh MQTT client, connects it, subscribes our routes, and
-/// publishes the new client into `state` so that all publishers use it.
-async fn connect_mqtt_session(
+fn subscribe_routes(client: &Client, router: &MqttRouter<Arc<Pv2MqttState>>) -> anyhow::Result<()> {
+    for topic in router.topics() {
+        client.try_subscribe(&topic, QoS::AtMostOnce)?;
+    }
+    Ok(())
+}
+
+/// A connected client, the event loop that drives it, and its routes.
+struct MqttSession {
+    client: Client,
+    eventloop: EventLoop,
+    router: Arc<MqttRouter<Arc<Pv2MqttState>>>,
+}
+
+/// A client ID that is unique per process, so a second bridge (or a
+/// restart racing the old session) cannot evict this one, and short
+/// enough for brokers that enforce MQTT 3.1's 23-character limit.
+fn mqtt_client_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    format!("{MODEL}-{:012x}", hasher.finish() & 0xffff_ffff_ffff)
+}
+
+fn mqtt_options(params: &MqttSessionParams, serial: &str) -> MqttOptions {
+    let mut options = MqttOptions::new(mqtt_client_id(), &params.mqtt_host, params.mqtt_port);
+    options
+        .set_keep_alive(MQTT_KEEP_ALIVE)
+        .set_clean_session(true)
+        // Discovery payloads easily exceed rumqttc's 10 KiB default.
+        .set_max_packet_size(MQTT_MAX_PACKET, MQTT_MAX_PACKET)
+        .set_last_will(LastWill::new(
+            format!("{MODEL}/bridge/{serial}/availability"),
+            "offline",
+            QoS::AtLeastOnce,
+            true,
+        ));
+    if let Some(username) = &params.mqtt_username {
+        options.set_credentials(username, params.mqtt_password.clone().unwrap_or_default());
+    }
+    options
+}
+
+/// Connects a fresh client and subscribes our routes. Waits for the
+/// broker's CONNACK so a bad host or refused login fails here.
+async fn open_mqtt_session(
+    params: &MqttSessionParams,
+    serial: &str,
+    discovery_prefix: &str,
+) -> anyhow::Result<MqttSession> {
+    let broker = format!("{}:{}", params.mqtt_host, params.mqtt_port);
+    let (client, mut eventloop) =
+        AsyncClient::new(mqtt_options(params, serial), MQTT_REQUEST_CAPACITY);
+    tokio::time::timeout(MQTT_CONNECT_TIMEOUT, async {
+        loop {
+            if let Event::Incoming(Packet::ConnAck(_)) = eventloop.poll().await? {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await
+    .with_context(|| format!("timed out connecting to mqtt broker {broker}"))?
+    .with_context(|| format!("connecting to mqtt broker {broker}"))?;
+    let client = Client::new(client);
+    let router = build_router(discovery_prefix);
+    subscribe_routes(&client, &router)?;
+    Ok(MqttSession {
+        client,
+        eventloop,
+        router,
+    })
+}
+
+/// Rebuilds the session after the previous one failed, and points every
+/// publisher at the new client.
+async fn reopen_mqtt_session(
     params: &MqttSessionParams,
     state: &Arc<Pv2MqttState>,
     tx: &tokio::sync::mpsc::Sender<ServerEvent>,
     discovery_prefix: &str,
-) -> anyhow::Result<(
-    Client,
-    async_channel::Receiver<Event>,
-    Arc<MqttRouter<Arc<Pv2MqttState>>>,
-)> {
-    let client = Client::with_auto_id()?;
-    client.set_last_will(
-        format!("{MODEL}/bridge/{}/availability", state.serial),
-        "offline",
-        QoS::AtLeastOnce,
-        true,
-    )?;
-    client.set_username_and_password(
-        params.mqtt_username.as_deref(),
-        params.mqtt_password.as_deref(),
-    )?;
-    client.set_reconnect_delay(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY, true)?;
-    tokio::time::timeout(
-        MQTT_CONNECT_TIMEOUT,
-        client.connect(
-            &params.mqtt_host,
-            params.mqtt_port.into(),
-            Duration::from_secs(10),
-            None,
-        ),
-    )
-    .await
-    .context("timed out connecting to mqtt broker")?
-    .with_context(|| {
-        format!(
-            "connecting to mqtt broker {}:{}",
-            params.mqtt_host, params.mqtt_port
-        )
-    })?;
-    let subscriber = client
-        .subscriber()
-        .ok_or_else(|| anyhow::anyhow!("subscriber channel unavailable on new client"))?;
-    let router = build_router(&client, discovery_prefix).await?;
-    state.client.store(Arc::new(client.clone()));
+) -> anyhow::Result<MqttSession> {
+    let session = open_mqtt_session(params, &state.serial, discovery_prefix).await?;
+    state.client.store(Arc::new(session.client.clone()));
     state.mqtt_reconnects.fetch_add(1, Ordering::SeqCst);
     // Ask the serve loop to re-register everything with hass; that path
     // tolerates (and reports) an unresponsive hub instead of failing us.
     tx.send(ServerEvent::Register).await.ok();
-    Ok((client, subscriber, router))
+    Ok(session)
 }
 
-/// Forwards MQTT events to the serve loop until the session dies.
-/// Transient disconnects are handled by libmosquitto's auto-reconnect;
-/// we resubscribe when the connection comes back. Returns an error when
-/// the session is beyond repair and must be rebuilt from a new client.
+/// Polls the event loop, forwarding messages to the serve loop, until the
+/// session dies. Polling again after an error makes rumqttc reconnect, so
+/// transient outages are handled here with backoff; on reconnect we
+/// resubscribe (the session is clean) and re-register with hass. Returns an
+/// error when the session must be rebuilt from a new client.
 async fn mqtt_event_pump(
-    client: Client,
-    subscriber: async_channel::Receiver<Event>,
-    mut router: Arc<MqttRouter<Arc<Pv2MqttState>>>,
+    session: MqttSession,
     tx: tokio::sync::mpsc::Sender<ServerEvent>,
-    discovery_prefix: String,
     state: Arc<Pv2MqttState>,
 ) -> anyhow::Result<()> {
-    let mut need_rebuild = false;
+    let MqttSession {
+        client,
+        mut eventloop,
+        router,
+    } = session;
+    // Mark the client offline however this pump ends, so publishers fail
+    // fast instead of queueing behind a loop that nobody polls.
+    struct Offline(Client);
+    impl Drop for Offline {
+        fn drop(&mut self) {
+            self.0.set_connected(false);
+        }
+    }
+    let _offline = Offline(client.clone());
+    let mut delay = RECONNECT_BASE_DELAY;
     loop {
-        let event = subscriber
-            .recv()
-            .await
-            .map_err(|_| anyhow::anyhow!("mqtt client closed the event channel"))?;
-        match event {
-            Event::Message(msg) => {
+        match eventloop.poll().await {
+            Ok(Event::Incoming(Packet::Publish(publish))) => {
                 tx.send(ServerEvent::MqttMessage {
-                    msg,
+                    msg: Message {
+                        topic: publish.topic,
+                        payload: publish.payload.to_vec(),
+                    },
                     router: router.clone(),
                     received: std::time::Instant::now(),
                 })
                 .await
                 .context("serve loop is gone")?;
             }
-            Event::Disconnected(reason) => {
-                log::warn!("MQTT disconnected: {reason}; waiting for reconnect");
-                need_rebuild = true;
+            Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                log::info!("MQTT reconnected");
+                delay = RECONNECT_BASE_DELAY;
+                client.set_connected(true);
+                state.mqtt_reconnects.fetch_add(1, Ordering::SeqCst);
+                subscribe_routes(&client, &router).context("resubscribing after mqtt reconnect")?;
+                // Re-register with hass via the fault-tolerant serve loop path
+                tx.send(ServerEvent::Register).await.ok();
             }
-            Event::Connected(status) => {
-                log::info!("MQTT (re)connected {status}");
-                if need_rebuild {
-                    state.mqtt_reconnects.fetch_add(1, Ordering::SeqCst);
-                    router = build_router(&client, &discovery_prefix)
-                        .await
-                        .context("resubscribing after mqtt reconnect")?;
-                    need_rebuild = false;
-                    // Re-register with hass via the fault-tolerant serve loop path
-                    tx.send(ServerEvent::Register).await.ok();
+            Ok(Event::Incoming(Packet::SubAck(ack))) => {
+                anyhow::ensure!(
+                    !ack.return_codes.contains(&SubscribeReasonCode::Failure),
+                    "broker refused a subscription: {:?}",
+                    ack.return_codes
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if client.is_connected() {
+                    log::warn!("MQTT disconnected: {err}; reconnecting");
+                    client.set_connected(false);
+                } else {
+                    log::debug!("MQTT reconnect failed: {err}; retrying in {delay:?}");
                 }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RECONNECT_MAX_DELAY);
             }
         }
     }
@@ -2728,6 +2756,424 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
 
+    /// A real broker (rumqttd, in-process) behind a TCP proxy that a test can
+    /// cut, to exercise the session against genuine disconnects.
+    mod broker {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::{TcpListener, TcpStream};
+
+        pub const USER: &str = "pview";
+        pub const PASSWORD: &str = "test-password";
+
+        fn free_port() -> u16 {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        /// Starts a broker that requires USER/PASSWORD and returns its port.
+        pub async fn start() -> u16 {
+            let port = free_port();
+            let config: rumqttd::Config = serde_json::from_value(serde_json::json!({
+                "id": 0,
+                "router": {
+                    "max_connections": 16,
+                    "max_outgoing_packet_count": 200,
+                    "max_segment_size": 104857600,
+                    "max_segment_count": 10,
+                },
+                "v4": {"1": {
+                    "name": "v4",
+                    "listen": format!("127.0.0.1:{port}"),
+                    "next_connection_delay_ms": 1,
+                    "connections": {
+                        "connection_timeout_ms": 5000,
+                        "max_payload_size": 1048576,
+                        "max_inflight_count": 100,
+                        "auth": {USER: PASSWORD},
+                    },
+                }},
+            }))
+            .unwrap();
+            std::thread::spawn(move || rumqttd::Broker::new(config).start().unwrap());
+            for _ in 0..100 {
+                if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    return port;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("broker did not start");
+        }
+
+        /// Forwards connections to the broker until `cut`, which drops every
+        /// open connection and refuses new ones until `restore`.
+        pub struct Proxy {
+            pub port: u16,
+            blocked: Arc<AtomicBool>,
+            links: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+        }
+
+        impl Proxy {
+            pub async fn start(broker: u16) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let blocked = Arc::new(AtomicBool::new(false));
+                let links = Arc::new(Mutex::new(vec![]));
+                let (b, l) = (blocked.clone(), links.clone());
+                tokio::spawn(async move {
+                    while let Ok((mut inbound, _)) = listener.accept().await {
+                        if b.load(Ordering::SeqCst) {
+                            continue; // dropped: the client sees a reset
+                        }
+                        let link = tokio::spawn(async move {
+                            let mut outbound =
+                                TcpStream::connect(("127.0.0.1", broker)).await.unwrap();
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        });
+                        l.lock().unwrap().push(link.abort_handle());
+                    }
+                });
+                Self {
+                    port,
+                    blocked,
+                    links,
+                }
+            }
+
+            pub fn cut(&self) {
+                self.blocked.store(true, Ordering::SeqCst);
+                for link in self.links.lock().unwrap().drain(..) {
+                    link.abort();
+                }
+            }
+
+            pub fn restore(&self) {
+                self.blocked.store(false, Ordering::SeqCst);
+            }
+        }
+
+        /// A plain client on the broker that records messages on `filters`.
+        pub struct Observer {
+            pub client: rumqttc::AsyncClient,
+            pub messages: tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+        }
+
+        impl Observer {
+            pub async fn start(broker: u16, filters: &[&str]) -> Self {
+                let mut options = rumqttc::MqttOptions::new("observer", "127.0.0.1", broker);
+                options
+                    .set_credentials(USER, PASSWORD)
+                    .set_max_packet_size(1 << 20, 1 << 20);
+                let (client, mut eventloop) = rumqttc::AsyncClient::new(options, 64);
+                for filter in filters {
+                    client
+                        .subscribe(*filter, rumqttc::QoS::AtLeastOnce)
+                        .await
+                        .unwrap();
+                }
+                let (tx, messages) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    while let Ok(event) = eventloop.poll().await {
+                        if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(p)) = event {
+                            let payload = String::from_utf8_lossy(&p.payload).to_string();
+                            if tx.send((p.topic, payload)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                Self { client, messages }
+            }
+
+            /// Waits for `topic` to carry `payload`, skipping anything else.
+            pub async fn expect(&mut self, topic: &str, payload: &str) {
+                let wait = async {
+                    while let Some((t, p)) = self.messages.recv().await {
+                        if t == topic && p == payload {
+                            return;
+                        }
+                    }
+                    panic!("observer stopped");
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+                    .await
+                    .unwrap_or_else(|_| panic!("never saw {topic} = {payload}"));
+            }
+        }
+    }
+
+    fn broker_params(port: u16, password: &str) -> MqttSessionParams {
+        MqttSessionParams {
+            mqtt_host: "127.0.0.1".into(),
+            mqtt_port: port,
+            mqtt_username: Some(broker::USER.into()),
+            mqtt_password: Some(password.into()),
+        }
+    }
+
+    /// Publishes a command until the bridge's router receives it (the
+    /// subscription may still be in flight), and returns the next events.
+    async fn deliver_command(observer: &broker::Observer, rx: &mut Receiver<ServerEvent>) {
+        let topic = "pv2mqtt/shade/test/7/command";
+        let wait = async {
+            loop {
+                observer
+                    .client
+                    .publish(topic, rumqttc::QoS::AtMostOnce, false, "STOP")
+                    .await
+                    .unwrap();
+                match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+                    Ok(Some(ServerEvent::MqttMessage { msg, .. })) => {
+                        assert_eq!(msg.topic, topic);
+                        assert_eq!(msg.payload, b"STOP");
+                        return;
+                    }
+                    Ok(Some(_)) | Err(_) => continue,
+                    Ok(None) => panic!("event channel closed"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("command never reached the bridge");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mqtt_session_survives_a_broker_outage() {
+        let broker_port = broker::start().await;
+        let proxy = broker::Proxy::start(broker_port).await;
+        let mut observer = broker::Observer::start(broker_port, &["pv2mqtt/#"]).await;
+
+        let refused =
+            open_mqtt_session(&broker_params(proxy.port, "wrong"), "test", "homeassistant").await;
+        assert!(refused.is_err(), "a bad password must fail the connection");
+
+        let session = open_mqtt_session(
+            &broker_params(proxy.port, broker::PASSWORD),
+            "test",
+            "homeassistant",
+        )
+        .await
+        .unwrap();
+        let (state, mut rx) = test_state();
+        let client = session.client.clone();
+        state.client.store(Arc::new(client.clone()));
+        tokio::spawn(mqtt_event_pump(
+            session,
+            state.events.clone(),
+            state.clone(),
+        ));
+
+        deliver_command(&observer, &mut rx).await;
+        publish_availability(&state, "pv2mqtt/bridge/test/availability".into(), true)
+            .await
+            .unwrap();
+        observer
+            .expect("pv2mqtt/bridge/test/availability", "online")
+            .await;
+
+        // An abrupt drop: the broker publishes our last will, and publishing
+        // fails fast instead of queueing behind the reconnect.
+        proxy.cut();
+        observer
+            .expect("pv2mqtt/bridge/test/availability", "offline")
+            .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while client.is_connected() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("pump never noticed the disconnect");
+        let started = std::time::Instant::now();
+        let err = publish_availability(&state, "pv2mqtt/bridge/test/availability".into(), true)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not connected"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // Back again: the same client reconnects, asks for re-registration,
+        // and is subscribed to commands once more.
+        proxy.restore();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(ServerEvent::Register) = rx.recv().await {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("no re-registration after reconnect");
+        assert!(client.is_connected());
+        assert_eq!(state.mqtt_reconnects.load(Ordering::SeqCst), 1);
+        deliver_command(&observer, &mut rx).await;
+        publish_availability(&state, "pv2mqtt/bridge/test/availability".into(), true)
+            .await
+            .unwrap();
+        observer
+            .expect("pv2mqtt/bridge/test/availability", "online")
+            .await;
+    }
+
+    /// A loopback PowerView hub with `shades` bottom-up shades in one room
+    /// and `scenes` scenes, recording the request line of every call.
+    struct FakeHub {
+        port: u16,
+        requests: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl FakeHub {
+        fn start(shades: i32, scenes: i32) -> Self {
+            use std::io::Write;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = Arc::new(StdMutex::new(vec![]));
+            let log = requests.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = stream.unwrap();
+                    let log = log.clone();
+                    std::thread::spawn(move || {
+                        let request = crate::test_support::read_http_request(&mut stream);
+                        let line = request.lines().next().unwrap_or_default().to_string();
+                        log.lock().unwrap().push(line.clone());
+                        let path = line.split(' ').nth(1).unwrap_or_default();
+                        let body = match path {
+                            "/gateway" => serde_json::json!({"config": {
+                                "serialNumber": "fakehub", "brand": "HD", "model": "G3",
+                                "firmware": {"mainProcessor": {"name": "hub", "revision": 3, "subRevision": 0, "build": 1}},
+                                "networkStatus": {"ipAddress": "127.0.0.1", "primaryMacAddress": "00:11:22:33:44:55"}
+                            }}),
+                            "/home/rooms" => serde_json::json!([{
+                                "id": 1, "ptName": "Living", "name": "TGl2aW5n", "color": "0", "icon": "0", "type": 0
+                            }]),
+                            "/home/shades" => (1..=shades)
+                                .map(|id| serde_json::to_value(test_shade(id)).unwrap())
+                                .collect(),
+                            "/home/scenes" => (1..=scenes)
+                                .map(|id| serde_json::json!({
+                                    "id": id, "ptName": format!("Scene {id}"), "name": "U2NlbmU=",
+                                    "color": "0", "icon": "0", "networkNumber": id, "roomIds": [1]
+                                }))
+                                .collect(),
+                            _ if line.starts_with("PUT ") => serde_json::json!({}),
+                            _ => {
+                                // Includes the SSE stream: the bridge retries it.
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                );
+                                return;
+                            }
+                        };
+                        let body = body.to_string();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    });
+                }
+            });
+            Self { port, requests }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_startup_registers_everything_and_routes_commands() {
+        use clap::Parser;
+        // Enough shades that the discovery burst overflows rumqttc's request
+        // queue (MQTT_REQUEST_CAPACITY), so publishing must wait on the pump.
+        const SHADES: i32 = 150;
+        const SCENES: i32 = 30;
+        let hub = FakeHub::start(SHADES, SCENES);
+        let broker_port = broker::start().await;
+        let mut observer =
+            broker::Observer::start(broker_port, &["homeassistant/#", "pv2mqtt/#"]).await;
+        let state_dir =
+            std::env::temp_dir().join(format!("pview-startup-test-{}", std::process::id()));
+        let command = ServeMqttCommand {
+            host: Some("127.0.0.1".into()),
+            port: Some(broker_port),
+            username: Some(broker::USER.into()),
+            password: Some(broker::PASSWORD.into()),
+            discovery_prefix: "homeassistant".into(),
+            state_file: Some(state_dir.join("state.json")),
+        };
+        let mut args = crate::Args::parse_from(["pview", "--hub-ip", "127.0.0.1", "serve-mqtt"]);
+        args.hub_instance =
+            tokio::sync::Mutex::new(Some(Hub::with_port("127.0.0.1".parse().unwrap(), hub.port)));
+        let bridge = tokio::spawn(async move { command.run_session(&args).await });
+
+        // The whole discovery burst reaches the broker, retained topics and all.
+        let mut seen = HashMap::new();
+        let complete = |seen: &HashMap<String, String>| {
+            let count = |kind: &str| {
+                seen.iter()
+                    .filter(|(topic, payload)| {
+                        topic.starts_with(&format!("homeassistant/{kind}/"))
+                            && topic.ends_with("/config")
+                            && !payload.is_empty()
+                    })
+                    .count() as i32
+            };
+            count("cover") == SHADES
+                && count("scene") == SCENES
+                && seen
+                    .get("pv2mqtt/bridge/fakehub/availability")
+                    .map(String::as_str)
+                    == Some("online")
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !complete(&seen) {
+                let (topic, payload) = observer.messages.recv().await.unwrap();
+                seen.insert(topic, payload);
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("discovery incomplete; saw {} topics", seen.len()));
+        let cover: serde_json::Value =
+            serde_json::from_str(&seen["homeassistant/cover/fakehub-3/config"]).unwrap();
+        assert_eq!(cover["command_topic"], "pv2mqtt/shade/fakehub/3/command");
+        assert_eq!(
+            cover["origin"]["support_url"],
+            "https://github.com/benbraun/pview"
+        );
+
+        // A command from Home Assistant reaches the hub.
+        observer
+            .client
+            .publish(
+                "pv2mqtt/shade/fakehub/3/command",
+                rumqttc::QoS::AtLeastOnce,
+                false,
+                "STOP",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if hub
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|line| line.starts_with("PUT /home/shades/stop?ids=3 "))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("STOP never reached the hub");
+        bridge.abort();
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
     fn test_state() -> (Arc<Pv2MqttState>, Receiver<ServerEvent>) {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let gateway_data = serde_json::from_value(serde_json::json!({
@@ -2741,7 +3187,7 @@ mod tests {
                     hub: Hub::with_addr("127.0.0.1".parse().unwrap()),
                     gateway_data,
                 })),
-                client: ArcSwap::new(Arc::new(Client::with_auto_id().unwrap())),
+                client: ArcSwap::new(Arc::new(Client::offline())),
                 serial: "test".into(),
                 discovery_prefix: "homeassistant".into(),
                 first_run: AtomicBool::new(true),

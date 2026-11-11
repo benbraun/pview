@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/work/target \
     CC=clang cargo build --locked --release \
         --target "$(cat /rust_target.txt)" \
-        --bin pview --no-default-features --features mqtt-no-tls && \
+        --bin pview && \
     cp "target/$(cat /rust_target.txt)/release/pview" /pview
 
 ####################################################################################################

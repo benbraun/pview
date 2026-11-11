@@ -1,6 +1,6 @@
-## This flavor of the build is without TLS support.
-## It is consequently very easy to cross compile, which yields
-## fast builds for the various platforms.
+## Cross-compiled build for amd64, arm64 and 32-bit ARM. pview is pure Rust
+## (MQTT via rumqttc), so this and Dockerfile produce the same bridge; the
+## "notls" name and image are kept for existing users.
 ####################################################################################################
 ## Builder
 ####################################################################################################
@@ -37,7 +37,7 @@ RUN --mount=type=ssh \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/work/target \
-    CC=clang cargo install --locked --target $(cat /rust_target.txt) --bin pview --no-default-features --features mqtt-no-tls --path .
+    CC=clang cargo install --locked --target $(cat /rust_target.txt) --bin pview --path .
 
 ####################################################################################################
 ## Final image
