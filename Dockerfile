@@ -1,7 +1,7 @@
 ####################################################################################################
 ## Builder
 ####################################################################################################
-FROM alpine:3.21 AS builder
+FROM alpine:3.24 AS builder
 
 RUN apk --no-cache add rustup cargo g++ openssl openssl-dev git
 RUN rustup-init -y

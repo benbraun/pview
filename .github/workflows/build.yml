@@ -172,57 +172,58 @@ jobs:
         run: |
           docker buildx imagetools inspect ${{ env.IMAGE_NO_TLS }}:${{ steps.meta.outputs.version }}
 
-  # Publishes the prebuilt addon images that Supervisor pulls
-  # (config.yaml image: ghcr.io/.../pview-addon-{arch}). The formerly used
-  # home-assistant/builder is deprecated, so this builds the addon
-  # Dockerfile directly with buildx. Keep the matrix in sync with
-  # addon/build.yaml and the arch list in addon/config.yaml.
+  # Publishes the prebuilt app images that Supervisor pulls
+  # (addon/config.yaml image: ghcr.io/.../pview-addon-{arch}) with Home
+  # Assistant's composable builder action, natively on amd64 and arm64
+  # runners, and signs them with Cosign. Keep the matrix in sync with the arch
+  # list in addon/config.yaml.
   addon:
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
-    runs-on: ubuntu-latest
+    name: Publish ${{ matrix.arch }} app image
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+      id-token: write # Cosign keyless signing
       packages: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
-            platform: linux/amd64
-            build_from: ghcr.io/home-assistant/amd64-base:3.21
+            os: ubuntu-24.04
           - arch: aarch64
-            platform: linux/arm64
-            build_from: ghcr.io/home-assistant/aarch64-base:3.21
-          - arch: armv7
-            platform: linux/arm/v7
-            build_from: ghcr.io/home-assistant/armv7-base:3.21
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-      - name: Login to GHCR
-        uses: docker/login-action@v4
         with:
-          registry: https://ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push ${{ matrix.arch }} addon image
-        uses: docker/build-push-action@v7
+          persist-credentials: false
+      - name: Check the app version matches the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' addon/config.yaml)
+          if [ "$version" != "$TAG" ]; then
+            echo "::error::addon/config.yaml version '$version' does not match tag '$TAG'; Supervisor would fail to pull the image"
+            exit 1
+          fi
+      - name: Build and push ${{ matrix.arch }} app image
+        uses: home-assistant/builder/actions/build-image@2026.09.0
         with:
+          arch: ${{ matrix.arch }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
           context: .
           file: addon/Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/pview-addon-${{ matrix.arch }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository_owner }}/pview-addon-${{ matrix.arch }}:latest
-          build-args: |
-            BUILD_FROM=${{ matrix.build_from }}
+          image: ghcr.io/${{ github.repository_owner }}/pview-addon-${{ matrix.arch }}
+          image-tags: |
+            ${{ github.ref_name }}
+            latest
           labels: |
+            io.hass.type=app
             io.hass.name=PowerView to MQTT Bridge
             io.hass.description=Control Hunter Douglas PowerView Gen 3 shades via Home Assistant MQTT
-            io.hass.arch=${{ matrix.arch }}
-            io.hass.type=addon
-            io.hass.version=${{ github.ref_name }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            io.hass.url=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=MIT
+          push: true
+          # Never overwrite a published release.
+          skip-existing: ${{ github.ref_name }}
+          version: ${{ github.ref_name }}

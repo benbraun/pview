@@ -78,14 +78,13 @@ impl WorkQueue {
                 job.run = Box::pin(run);
                 return Ok(());
             }
-            if jobs.len() >= self.capacity {
-                if let Some(index) = jobs
+            if jobs.len() >= self.capacity
+                && let Some(index) = jobs
                     .iter()
                     .rposition(|job| !matches!(job.kind, WorkKind::Stop(_)))
-                {
-                    let displaced = jobs.remove(index).unwrap();
-                    log::warn!("Dropping queued {:?} to make room for STOP", displaced.kind);
-                }
+            {
+                let displaced = jobs.remove(index).unwrap();
+                log::warn!("Dropping queued {:?} to make room for STOP", displaced.kind);
             }
         }
         anyhow::ensure!(

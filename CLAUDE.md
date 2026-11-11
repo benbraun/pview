@@ -9,8 +9,14 @@ cargo build                  # dev build
 cargo build --release        # release build
 cargo check                  # fast type/borrow check
 cargo test                   # run all tests
+cargo clippy --all-targets   # lint; keep it warning-free
 cargo fmt                    # format code
 ```
+
+The default `mqtt-tls` feature compiles the vendored libmosquitto 2.0.9, which
+does not build against OpenSSL 4 (opaque `ASN1_STRING`). On a Mac with Homebrew
+`openssl@4`, set `OPENSSL_DIR=$(brew --prefix openssl@3)`, or build with
+`--no-default-features --features mqtt-no-tls`. Alpine 3.24 ships OpenSSL 3.5.
 
 Run a single command against a local hub:
 ```bash
@@ -52,6 +58,21 @@ Shades are identified by `"Room Shade"` (space-separated). `Hub::shade_by_name` 
 ### Tokio runtime
 
 Worker threads are intentionally limited to 2 (`#[tokio::main(worker_threads = 2)]`) to avoid overwhelming the hub with concurrent requests.
+
+## Home Assistant app
+
+`addon/` is a Home Assistant app (HA's new name for add-ons). The Dockerfile is
+built from the repository root (`docker buildx build -f addon/Dockerfile .`) on
+`ghcr.io/home-assistant/base`, which is multi-arch, so there is no `build.yaml`.
+HA dropped armv7, and only amd64 and aarch64 are published.
+
+Releases: `scripts/tag-release.sh` writes the tag into `addon/config.yaml` and
+tags the commit; pushing the tag makes `build.yml` publish
+`ghcr.io/benbraun/pview-addon-{arch}:<tag>` with `home-assistant/builder`'s
+`build-image` action. The job refuses a tag that differs from the config
+version, because Supervisor pulls exactly that tag. The images keep the
+per-arch `{arch}` names because the existing GHCR packages are public; a new
+multi-arch package name would start out private.
 
 ## References
 

@@ -85,7 +85,7 @@ impl Args {
     }
 
     pub fn hub_ip(&self) -> anyhow::Result<Option<IpAddr>> {
-        match self.hub_ip.clone() {
+        match self.hub_ip {
             Some(u) => Ok(Some(u)),
             None => opt_env_var("PV_HUB_IP"),
         }

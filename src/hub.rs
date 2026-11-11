@@ -324,7 +324,7 @@ impl Hub {
     /// `Unknown` events are logged at debug level and not yielded.
     pub async fn shade_events_stream(
         &self,
-    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShadeEvent>>> {
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<ShadeEvent>> + use<>> {
         // No overall timeout: this is a long-lived streaming connection.
         // TCP keepalive is what detects a half-open connection (hub reboot
         // or network drop without a FIN): the probes fail and the stream

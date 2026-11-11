@@ -5,10 +5,10 @@ keywords = ["powerview", "home-automation"]
 license = "MIT"
 name = "pview"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "PowerView to MQTT bridge for Home Assistant"
 build = "build.rs"
-rust-version = "1.75"
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -18,37 +18,37 @@ mqtt-tls = ["mosquitto-rs/vendored-mosquitto", "mosquitto-rs/vendored-mosquitto-
 mqtt-no-tls = ["mosquitto-rs/vendored-mosquitto"]
 
 [dependencies]
-anyhow = "1.0.86"
-arc-swap = "1.7.1"
-async-channel = "2.3"
+anyhow = "1.0.104"
+arc-swap = "1.9.5"
+async-channel = "2.5"
 async-stream = "0.3"
-bitflags = { version = "2.5.0", features = ["serde"] }
-chrono = "0.4.38"
+bitflags = { version = "2.13", features = ["serde"] }
+chrono = "0.4.45"
 chrono-tz = "0.10.4"
-clap = { version = "4.5.4", features = ["derive"] }
-color-backtrace = "0.7.2"
+clap = { version = "4.6.7", features = ["derive"] }
+color-backtrace = "0.7.4"
 dotenvy = "0.15.7"
 env_logger = "0.11"
-futures-util = "0.3"
-iana-time-zone = "0.1.60"
-log = "0.4.21"
-reqwest = { version = "0.13.4", default-features=false, features = ["json", "stream"] }
-serde = { version = "1.0.202", features = ["derive"] }
-serde_json = "1.0.117"
-serde_repr = "0.1.19"
+futures-util = "0.3.34"
+iana-time-zone = "0.1.65"
+log = "0.4.35"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_repr = "0.1.21"
 tabout = "0.3.0"
-thiserror = "2.0.18"
-tokio = { version = "1.37.0", features = ["rt", "macros", "rt-multi-thread"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "macros", "rt-multi-thread"] }
 
 [dev-dependencies]
-tokio = { version = "1.37.0", features = ["rt", "macros", "time", "test-util"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "time", "test-util"] }
 
 [dependencies.wez-mdns]
-version = "0.1.2"
+version = "0.1.4"
 #path = "../mdns"
 
 [dependencies.mosquitto-rs]
-version="0.11.2"
+version = "0.11.2"
 default-features = false
 features = ["router"]
 #path = "../mosquitto-rs/mosquitto-rs"

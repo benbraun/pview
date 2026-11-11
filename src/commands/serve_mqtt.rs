@@ -200,11 +200,18 @@ fn is_ha_birth(status: &str) -> bool {
     status == "online"
 }
 
+#[derive(Default)]
 struct DiagnosticEntity {
     name: String,
     unique_id: String,
     value: String,
+    device_class: Option<&'static str>,
+    unit_of_measurement: Option<&'static str>,
+    state_class: Option<&'static str>,
 }
+
+/// Payload that MQTT sensors treat as "unknown" rather than as a value.
+const PAYLOAD_NONE: &str = "None";
 
 fn power_type_to_state(power_type: PowerType) -> &'static str {
     match power_type {
@@ -246,7 +253,7 @@ async fn register_diagnostic_entity(
                 suggested_area: None,
                 via_device: None,
             },
-            device_class: None,
+            device_class: diagnostic.device_class.map(str::to_string),
             origin: Origin::default(),
             unique_id: unique_id.to_string(),
             entity_category: Some("diagnostic".to_string()),
@@ -254,7 +261,8 @@ async fn register_diagnostic_entity(
             enabled_by_default: None,
         },
         state_topic: format!("{MODEL}/sensor/{unique_id}/state"),
-        unit_of_measurement: None,
+        unit_of_measurement: diagnostic.unit_of_measurement.map(str::to_string),
+        state_class: diagnostic.state_class.map(str::to_string),
     };
 
     reg.config(
@@ -270,8 +278,18 @@ async fn register_diagnostic_entity(
 }
 
 fn runtime_diagnostics(state: &Pv2MqttState) -> Vec<DiagnosticEntity> {
-    [
-        (
+    let entity = |name: &str, key: &str, value: String| DiagnosticEntity {
+        name: name.into(),
+        unique_id: format!("{}-{key}", state.serial),
+        value,
+        ..Default::default()
+    };
+    let counter = |name: &str, key: &str, value: u64| DiagnosticEntity {
+        state_class: Some("total_increasing"),
+        ..entity(name, key, value.to_string())
+    };
+    vec![
+        entity(
             "SSE Connection",
             "sse",
             if state.sse_connected.load(Ordering::SeqCst) {
@@ -281,34 +299,40 @@ fn runtime_diagnostics(state: &Pv2MqttState) -> Vec<DiagnosticEntity> {
             }
             .to_string(),
         ),
-        (
+        counter(
             "MQTT Reconnects",
             "mqtt-reconnects",
-            state.mqtt_reconnects.load(Ordering::SeqCst).to_string(),
+            state.mqtt_reconnects.load(Ordering::SeqCst),
         ),
-        (
+        counter(
             "Command Failures",
             "command-failures",
-            state.command_failures.load(Ordering::SeqCst).to_string(),
+            state.command_failures.load(Ordering::SeqCst),
         ),
-        (
-            "Last Command Latency (ms)",
-            "command-latency",
-            state.last_command_ms.load(Ordering::SeqCst).to_string(),
-        ),
-        (
-            "Last Reconciliation",
-            "last-reconciliation",
-            state.last_reconciliation.lock().unwrap().clone(),
-        ),
+        DiagnosticEntity {
+            device_class: Some("duration"),
+            unit_of_measurement: Some("ms"),
+            state_class: Some("measurement"),
+            ..entity(
+                "Last Command Latency",
+                "command-latency",
+                state.last_command_ms.load(Ordering::SeqCst).to_string(),
+            )
+        },
+        DiagnosticEntity {
+            device_class: Some("timestamp"),
+            ..entity(
+                "Last Reconciliation",
+                "last-reconciliation",
+                state
+                    .last_reconciliation
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| PAYLOAD_NONE.to_string()),
+            )
+        },
     ]
-    .into_iter()
-    .map(|(name, key, value)| DiagnosticEntity {
-        name: name.into(),
-        unique_id: format!("{}-{key}", state.serial),
-        value,
-    })
-    .collect()
 }
 
 async fn publish_runtime_diagnostics(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
@@ -334,6 +358,7 @@ async fn register_hub(
             name: "IP Address".to_string(),
             unique_id: format!("{serial}-hub-ip"),
             value: gateway_data.network_status.ip_address.clone(),
+            ..Default::default()
         },
         gateway_data,
         state,
@@ -351,6 +376,7 @@ async fn register_hub(
                 "UNRESPONSIVE"
             }
             .to_string(),
+            ..Default::default()
         },
         gateway_data,
         state,
@@ -422,10 +448,10 @@ fn capability_config(
 }
 
 fn reported_percent(state: &Pv2MqttState, key: &str, pct: u8) -> u8 {
-    if let Ok(address) = key.parse::<ShadeIdAddr>() {
-        if let Some(shade) = state.shades.lock().unwrap().get(&address.shade_id) {
-            return coordinate_percent(shade.capabilities, address.is_secondary, pct);
-        }
+    if let Ok(address) = key.parse::<ShadeIdAddr>()
+        && let Some(shade) = state.shades.lock().unwrap().get(&address.shade_id)
+    {
+        return coordinate_percent(shade.capabilities, address.is_secondary, pct);
     }
     pct
 }
@@ -616,6 +642,7 @@ async fn register_shades(
                 },
                 state_topic: state.battery_state_topic(shade),
                 unit_of_measurement: Some("%".to_string()),
+                state_class: Some("measurement".to_string()),
             };
             reg.delete(format!(
                 "{}/sensor/{device_id}-battery/config",
@@ -654,6 +681,7 @@ async fn register_shades(
                 },
                 state_topic: format!("{MODEL}/sensor/{device_id}-signal/state"),
                 unit_of_measurement: Some("dBm".to_string()),
+                state_class: Some("measurement".to_string()),
             };
             reg.delete(format!(
                 "{}/sensor/{device_id}-signal/config",
@@ -693,6 +721,7 @@ async fn register_shades(
                 },
                 state_topic: state.power_type_state_topic(shade),
                 unit_of_measurement: None,
+                state_class: None,
             };
             // Delete legacy select entity if present
             reg.delete(format!(
@@ -872,10 +901,9 @@ fn cache_snapshot(state: &Pv2MqttState, shades: &[ShadeData], revision: u64) {
             state.is_in_motion(shade.id),
             revision,
             state.revision.load(Ordering::SeqCst),
-        ) {
-            if let Some(previous) = cache.get(&shade.id) {
-                shade.positions = previous.positions.clone();
-            }
+        ) && let Some(previous) = cache.get(&shade.id)
+        {
+            shade.positions = previous.positions.clone();
         }
         cache.insert(shade.id, shade);
     }
@@ -955,7 +983,7 @@ async fn refresh_shades(state: &Arc<Pv2MqttState>) -> anyhow::Result<()> {
             .await?;
         }
     }
-    *state.last_reconciliation.lock().unwrap() = chrono::Utc::now().to_rfc3339();
+    *state.last_reconciliation.lock().unwrap() = Some(chrono::Utc::now().to_rfc3339());
     publish_runtime_diagnostics(state).await?;
     Ok(())
 }
@@ -1355,7 +1383,7 @@ impl ServeMqttCommand {
             mqtt_reconnects: AtomicU64::new(0),
             command_failures: AtomicU64::new(0),
             last_command_ms: AtomicU64::new(0),
-            last_reconciliation: std::sync::Mutex::new("Never".into()),
+            last_reconciliation: std::sync::Mutex::new(None),
             state_file: Some(state_file),
             persistence: tokio::sync::Mutex::new(()),
             hub_changed: tokio::sync::watch::channel(resolved.hub.addr()).0,
@@ -1428,10 +1456,10 @@ impl ServeMqttCommand {
                             while let Some(resolved_hub) = disco.recv().await {
                                 log::trace!("disco resolved: {resolved_hub:?}");
                                 if let Some(gateway_data) = &resolved_hub.gateway_data {
-                                    if let Some(serial) = &serial_filter {
-                                        if *serial != gateway_data.serial_number {
-                                            continue;
-                                        }
+                                    if let Some(serial) = &serial_filter
+                                        && *serial != gateway_data.serial_number
+                                    {
+                                        continue;
                                     }
                                     tx.send(ServerEvent::HubDiscovered(resolved_hub))
                                         .await
@@ -1562,10 +1590,10 @@ impl ServeMqttCommand {
         if state.shade_revision(event.id) != revision {
             return Ok(());
         }
-        if let Some(positions) = &event.current_positions {
-            if let Some(shade) = state.shades.lock().unwrap().get_mut(&event.id) {
-                shade.positions = positions.clone();
-            }
+        if let Some(positions) = &event.current_positions
+            && let Some(shade) = state.shades.lock().unwrap().get_mut(&event.id)
+        {
+            shade.positions = positions.clone();
         }
         if let Some(tilt) = event.current_positions.as_ref().and_then(|p| p.tilt) {
             publish_changed(
@@ -2359,7 +2387,7 @@ struct Pv2MqttState {
     mqtt_reconnects: AtomicU64,
     command_failures: AtomicU64,
     last_command_ms: AtomicU64,
-    last_reconciliation: std::sync::Mutex<String>,
+    last_reconciliation: std::sync::Mutex<Option<String>>,
     hub_changed: tokio::sync::watch::Sender<std::net::IpAddr>,
     /// Per-shade velocity (0.0–1.0). HA-driven; hub always reports 0 so we track it ourselves.
     velocities: std::sync::Mutex<HashMap<i32, f64>>,
@@ -2734,7 +2762,7 @@ mod tests {
                 mqtt_reconnects: AtomicU64::new(0),
                 command_failures: AtomicU64::new(0),
                 last_command_ms: AtomicU64::new(0),
-                last_reconciliation: std::sync::Mutex::new("Never".into()),
+                last_reconciliation: std::sync::Mutex::new(None),
                 state_file: None,
                 persistence: tokio::sync::Mutex::new(()),
                 hub_changed: tokio::sync::watch::channel("127.0.0.1".parse().unwrap()).0,
@@ -2965,6 +2993,62 @@ mod tests {
         assert_eq!(values["test-command-failures"], "2");
         assert_eq!(values["test-command-latency"], "150");
         assert_eq!(values["test-mqtt-reconnects"], "3");
+    }
+
+    fn entries(entries: &[RegEntry]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|RegEntry::Msg { topic, payload }| (topic.clone(), payload.clone()))
+            .collect()
+    }
+
+    async fn diagnostic_registration(state: &Arc<Pv2MqttState>) -> HassRegistration {
+        let gateway_data = state.hub.load().gateway_data.clone();
+        let mut reg = HassRegistration::new();
+        for diagnostic in runtime_diagnostics(state) {
+            register_diagnostic_entity(diagnostic, &gateway_data, state, &mut reg)
+                .await
+                .unwrap();
+        }
+        reg
+    }
+
+    #[tokio::test]
+    async fn diagnostic_discovery_declares_units_classes_and_origin() {
+        let (state, _rx) = test_state();
+        let reg = diagnostic_registration(&state).await;
+        let configs: HashMap<String, serde_json::Value> = entries(&reg.configs)
+            .into_iter()
+            .map(|(topic, payload)| (topic, serde_json::from_str(&payload).unwrap()))
+            .collect();
+        let latency = &configs["homeassistant/sensor/test-command-latency/config"];
+        assert_eq!(latency["name"], "Last Command Latency");
+        assert_eq!(latency["device_class"], "duration");
+        assert_eq!(latency["unit_of_measurement"], "ms");
+        assert_eq!(latency["state_class"], "measurement");
+        assert_eq!(
+            latency["origin"]["support_url"],
+            "https://github.com/benbraun/pview"
+        );
+        assert!(latency["origin"].get("url").is_none());
+        let failures = &configs["homeassistant/sensor/test-command-failures/config"];
+        assert_eq!(failures["state_class"], "total_increasing");
+        assert!(failures.get("device_class").is_none());
+        assert!(configs["homeassistant/sensor/test-sse/config"]
+            .get("state_class")
+            .is_none());
+        assert_eq!(
+            configs["homeassistant/sensor/test-last-reconciliation/config"]["device_class"],
+            "timestamp"
+        );
+
+        // A timestamp sensor rejects anything but ISO 8601, so it reads
+        // "None" (unknown) until the first reconciliation completes.
+        let topic = "pv2mqtt/sensor/test-last-reconciliation/state";
+        assert_eq!(entries(&reg.updates)[topic], "None");
+        *state.last_reconciliation.lock().unwrap() = Some("2026-11-10T12:00:00+00:00".into());
+        let reg = diagnostic_registration(&state).await;
+        assert_eq!(entries(&reg.updates)[topic], "2026-11-10T12:00:00+00:00");
     }
 
     #[test]

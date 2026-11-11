@@ -27,7 +27,7 @@ pub struct EntityConfig {
 pub struct Origin {
     pub name: &'static str,
     pub sw_version: &'static str,
-    pub url: &'static str,
+    pub support_url: &'static str,
 }
 
 impl Default for Origin {
@@ -35,7 +35,7 @@ impl Default for Origin {
         Self {
             name: MODEL,
             sw_version: pview_version(),
-            url: URL,
+            support_url: URL,
         }
     }
 }
@@ -87,6 +87,9 @@ pub struct SensorConfig {
     pub state_topic: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit_of_measurement: Option<String>,
+    /// `measurement` or `total_increasing`; makes HA keep long-term statistics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_class: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
