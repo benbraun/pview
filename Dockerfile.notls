@@ -14,7 +14,9 @@ RUN case "$TARGETPLATFORM" in \
       *) echo "Do $TARGETPLATFORM"; exit 1 ;; \
     esac ; \
     echo "Building for $TARGETPLATFORM via $(cat /rust_target.txt)"
-RUN apk --no-cache add clang git curl rustup musl lld
+# gcc supplies `cc`, which links build scripts and the amd64 target; Alpine's
+# clang stopped pulling it in after 3.21.
+RUN apk --no-cache add clang gcc git curl rustup musl-dev lld
 RUN rustup-init -y
 ENV PATH=/root/.cargo/bin:$PATH
 RUN rustup target add $(cat /rust_target.txt)
