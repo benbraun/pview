@@ -10,6 +10,7 @@ mod discovery;
 mod hass_helper;
 mod http_helpers;
 mod hub;
+mod mqtt;
 mod settings;
 #[cfg(test)]
 mod test_support;
@@ -85,7 +86,7 @@ impl Args {
     }
 
     pub fn hub_ip(&self) -> anyhow::Result<Option<IpAddr>> {
-        match self.hub_ip.clone() {
+        match self.hub_ip {
             Some(u) => Ok(Some(u)),
             None => opt_env_var("PV_HUB_IP"),
         }

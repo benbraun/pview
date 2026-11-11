@@ -1,11 +1,11 @@
-# PowerView to MQTT bridge: Home Assistant Add-On
+# PowerView to MQTT bridge: Home Assistant App
 
-This addon provides a bridge between a [Hunter Douglas PowerView
+This app (formerly called an add-on) provides a bridge between a [Hunter Douglas PowerView
 Hub](https://www.hunterdouglas.com/operating-systems/motorized/powerview) and
 Home Assistant, via the [Home Assistant MQTT
 Integration](https://www.home-assistant.io/integrations/mqtt/).
 
-Once you have configured your MQTT service credentials, this addon should
+Once you have configured your MQTT service credentials, this app should
 automatically discover your PowerView Hub and import its shades and scenes
 via the MQTT integration.
 
@@ -18,6 +18,7 @@ revision (including local changes):
 docker buildx build --platform linux/amd64 -f addon/Dockerfile .
 ```
 
-For ARM, also pass the matching `BUILD_FROM` image from `addon/build.yaml`.
+For ARM, use `--platform linux/arm64`; the default `BUILD_FROM` is the
+multi-arch Home Assistant base image. Only amd64 and aarch64 are supported.
 Release CI checks out the release tag and uses this same repository context;
 PR builds compile the checked-out PR source.

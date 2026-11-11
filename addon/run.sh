@@ -33,7 +33,12 @@ if bashio::config.has_value mqtt_password ; then
 fi
 
 if bashio::config.has_value debug_level ; then
-  export RUST_LOG="pview=$(bashio::config debug_level)"
+  # Accept a bare level ("trace") or a full filter ("pview=trace").
+  level="$(bashio::config debug_level)"
+  case "$level" in
+    *=*) export RUST_LOG="$level" ;;
+    *) export RUST_LOG="pview=$level" ;;
+  esac
 fi
 
 env | grep PV_ | sed -r 's/_(EMAIL|KEY|PASSWORD)=.*/_\1=REDACTED/'

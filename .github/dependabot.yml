@@ -16,3 +16,16 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+
+  # Builder stages and the app base image. Alpine and the Home Assistant base
+  # are both tagged by Alpine release; keep them on the same minor.
+  - package-ecosystem: "docker"
+    directories:
+      - "/"
+      - "/addon"
+    schedule:
+      interval: "weekly"
+    groups:
+      docker:
+        patterns:
+          - "*"

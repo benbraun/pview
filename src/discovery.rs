@@ -92,10 +92,10 @@ pub async fn resolve_hub_with_serial(
 ) -> anyhow::Result<Hub> {
     let mut rx = resolve_hubs(timeout).await?;
     while let Some(hub) = rx.recv().await {
-        if let Some(gateway_data) = &hub.gateway_data {
-            if gateway_data.serial_number == serial {
-                return Ok(hub.hub);
-            }
+        if let Some(gateway_data) = &hub.gateway_data
+            && gateway_data.serial_number == serial
+        {
+            return Ok(hub.hub);
         }
     }
     anyhow::bail!("No hub found with serial {serial}");

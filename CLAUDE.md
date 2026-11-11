@@ -9,8 +9,16 @@ cargo build                  # dev build
 cargo build --release        # release build
 cargo check                  # fast type/borrow check
 cargo test                   # run all tests
+cargo clippy --all-targets   # lint; keep it warning-free
 cargo fmt                    # format code
 ```
+
+There is no C code to build: MQTT is rumqttc without TLS (pview has never
+connected to the broker over TLS). The `mqtt-tls` and `mqtt-no-tls` features are
+empty and exist only so old build commands keep working.
+
+The `serve_mqtt` tests run a real broker (rumqttd, a dev-dependency) in-process,
+behind a TCP proxy they can cut, and a loopback fake hub.
 
 Run a single command against a local hub:
 ```bash
@@ -36,7 +44,8 @@ CLI args (`main.rs`) → `Args::hub()` resolves the hub (mDNS via `discovery.rs`
 - **`hub.rs`** — `Hub` struct; one public method per API operation. Shade positions are normalised `0.0–1.0` floats in the API; `ShadePosition::pos_to_percent`/`percent_to_pos` convert to/from 0–100.
 - **`discovery.rs`** — mDNS discovery using service name `_PowerView-G3._tcp.local`. Hub resolves to a `ResolvedHub` carrying the IP.
 - **`hass_helper.rs`** — Typed serde structs for Home Assistant MQTT discovery payloads (covers, sensors, buttons, scenes).
-- **`commands/serve_mqtt.rs`** — The main long-running service. Uses `mosquitto-rs` with a topic router. Maintains an SSE connection to `home/shades/events` and drives position interpolation tasks (per-shade `AbortHandle` stored in `Pv2MqttState.motion_tasks`).
+- **`mqtt.rs`** — The MQTT layer over rumqttc: a `Client` that fails fast while disconnected (callers then re-send after the reconnect re-registration) and an `MqttRouter` whose handlers take `Topic`/`Payload`/`Params`/`State` extractors.
+- **`commands/serve_mqtt.rs`** — The main long-running service. One task polls the rumqttc `EventLoop` (`mqtt_event_pump`); it must be running before anything is published, because rumqttc only sends what the poller pulls off its request queue. Polling after an error reconnects; on CONNACK the pump resubscribes (clean session) and asks the serve loop to re-register. Maintains an SSE connection to `home/shades/events` and drives position interpolation tasks (per-shade `AbortHandle` stored in `Pv2MqttState.motion_tasks`).
 
 ### Shade naming
 
@@ -52,6 +61,21 @@ Shades are identified by `"Room Shade"` (space-separated). `Hub::shade_by_name` 
 ### Tokio runtime
 
 Worker threads are intentionally limited to 2 (`#[tokio::main(worker_threads = 2)]`) to avoid overwhelming the hub with concurrent requests.
+
+## Home Assistant app
+
+`addon/` is a Home Assistant app (HA's new name for add-ons). The Dockerfile is
+built from the repository root (`docker buildx build -f addon/Dockerfile .`) on
+`ghcr.io/home-assistant/base`, which is multi-arch, so there is no `build.yaml`.
+HA dropped armv7, and only amd64 and aarch64 are published.
+
+Releases: `scripts/tag-release.sh` writes the tag into `addon/config.yaml` and
+tags the commit; pushing the tag makes `build.yml` publish
+`ghcr.io/benbraun/pview-addon-{arch}:<tag>` with `home-assistant/builder`'s
+`build-image` action. The job refuses a tag that differs from the config
+version, because Supervisor pulls exactly that tag. The images keep the
+per-arch `{arch}` names because the existing GHCR packages are public; a new
+multi-arch package name would start out private.
 
 ## References
 

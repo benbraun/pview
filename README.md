@@ -28,14 +28,14 @@ So why do this?
 This is a fork of [wez/pview](https://github.com/wez/pview) with additional
 fixes for PowerView Gen 3 hubs.
 
-## Home Assistant OS Add-on
+## Home Assistant OS App
 
-If you run Home Assistant OS (or Supervised), the easiest way to use this is
-as an add-on:
+If you run Home Assistant OS, the easiest way to use this is as an app
+(what Home Assistant used to call an add-on). It runs on amd64 and aarch64.
 
 1. Ensure the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/#configuration)
-   is configured (the Mosquitto broker add-on works out of the box).
-2. In Home Assistant, go to **Settings → Add-ons → Add-on Store**, open the
+   is configured (the Mosquitto broker app works out of the box).
+2. In Home Assistant, go to **Settings → Apps → Install app**, open the
    menu (⋮) → **Repositories**, and add:
 
    ```
@@ -44,9 +44,9 @@ as an add-on:
 
    [![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fbenbraun%2Fpview)
 
-3. Install the **PowerView to MQTT Bridge** add-on and start it. If you use
-   the Mosquitto add-on, MQTT credentials are discovered automatically;
-   otherwise set them in the add-on configuration.
+3. Install the **PowerView to MQTT Bridge** app and start it. If you use
+   the Mosquitto broker app, MQTT credentials are discovered automatically;
+   otherwise set them in the app configuration.
 
 ## How do I use this with docker compose?
 
@@ -316,7 +316,7 @@ $ pview serve-mqtt
 
 ## Persistent settings
 
-Velocity settings and the MQTT discovery manifest survive restarts. The add-on
+Velocity settings and the MQTT discovery manifest survive restarts. The app
 stores them in `/data/pview-state.json`; the supplied Compose file uses a named
 volume. Standalone runs default to `$XDG_STATE_HOME/pview/` or
 `$HOME/.local/state/pview/`, with a separate file per hub. Override with

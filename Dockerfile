@@ -1,15 +1,12 @@
 ####################################################################################################
 ## Builder
 ####################################################################################################
-FROM alpine:3.21 AS builder
+FROM alpine:3.24 AS builder
 
-RUN apk --no-cache add rustup cargo g++ openssl openssl-dev git
+RUN apk --no-cache add rustup cargo g++ git
 RUN rustup-init -y
 ENV PATH=/root/.cargo/bin:$PATH
-ENV OPENSSL_STATIC=yes \
-    PKG_CONFIG_ALLOW_CROSS=true \
-    PKG_CONFIG_ALL_STATIC=true \
-    RUSTFLAGS="-C target-feature=-crt-static"
+ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 RUN adduser \
     --disabled-password \
@@ -44,7 +41,7 @@ COPY --from=builder --chown=1000:1000 /data /data
 
 WORKDIR /app
 
-COPY --from=builder /lib/ld-musl*.so* /lib/libssl*.so* /lib/libcrypto*.so* /usr/lib/libgcc*.so* /lib/
+COPY --from=builder /lib/ld-musl*.so* /usr/lib/libgcc*.so* /lib/
 COPY --from=builder /root/.cargo/bin/pview ./
 
 USER pview:pview

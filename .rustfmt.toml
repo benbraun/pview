@@ -1,5 +1,7 @@
 # Please keep these in alphabetical order.
 # https://github.com/rust-lang/rustfmt/issues/3149
-edition = "2021"
+edition = "2024"
+# Keep the 2021 formatting style so the edition bump does not reformat everything.
+style_edition = "2021"
 imports_granularity = "Module"
 tab_spaces = 4

@@ -56,6 +56,8 @@ pub struct ShadeData {
 }
 
 impl ShadeData {
+    /// The plain-text name; `name` holds the hub's raw base64 form.
+    #[allow(clippy::misnamed_getters)]
     pub fn name(&self) -> &str {
         &self.pt_name
     }

@@ -1,10 +1,10 @@
-## This flavor of the build is without TLS support.
-## It is consequently very easy to cross compile, which yields
-## fast builds for the various platforms.
+## Cross-compiled build for amd64, arm64 and 32-bit ARM. pview is pure Rust
+## (MQTT via rumqttc), so this and Dockerfile produce the same bridge; the
+## "notls" name and image are kept for existing users.
 ####################################################################################################
 ## Builder
 ####################################################################################################
-FROM --platform=$BUILDPLATFORM alpine:3.21 AS builder
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS builder
 ARG TARGETPLATFORM
 RUN case "$TARGETPLATFORM" in \
       "linux/arm/v7") echo armv7-unknown-linux-musleabihf > /rust_target.txt ;; \
@@ -14,7 +14,9 @@ RUN case "$TARGETPLATFORM" in \
       *) echo "Do $TARGETPLATFORM"; exit 1 ;; \
     esac ; \
     echo "Building for $TARGETPLATFORM via $(cat /rust_target.txt)"
-RUN apk --no-cache add clang git curl rustup musl lld
+# gcc supplies `cc`, which links build scripts and the amd64 target; Alpine's
+# clang stopped pulling it in after 3.21.
+RUN apk --no-cache add clang gcc git curl rustup musl-dev lld
 RUN rustup-init -y
 ENV PATH=/root/.cargo/bin:$PATH
 RUN rustup target add $(cat /rust_target.txt)
@@ -33,11 +35,18 @@ RUN mkdir -p /data && chown 1000:1000 /data
 WORKDIR /work
 COPY . .
 
+# .cargo/config.toml links aarch64/armv7 with bare lld for cross builds. On a
+# native builder cargo applies that to host proc-macros too, and bare lld cannot
+# find -lc or -lgcc_s, so link with cc when building for the build machine.
 RUN --mount=type=ssh \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/work/target \
-    CC=clang cargo install --locked --target $(cat /rust_target.txt) --bin pview --no-default-features --features mqtt-no-tls --path .
+    target="$(cat /rust_target.txt)" && \
+    if [ "$(rustc -vV | sed -n 's/^host: //p')" = "$target" ]; then \
+        export "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=cc"; \
+    fi && \
+    CC=clang cargo install --locked --target "$target" --bin pview --path .
 
 ####################################################################################################
 ## Final image

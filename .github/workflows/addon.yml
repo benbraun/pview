@@ -8,32 +8,38 @@ on:
       - "addon/**"
       - ".github/workflows/addon.yml"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Test build ${{ matrix.arch }} app image
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Keep in sync with the arch list in addon/config.yaml.
       matrix:
         include:
           - arch: amd64
-            platform: linux/amd64
-            build_from: ghcr.io/home-assistant/amd64-base:3.21
+            os: ubuntu-24.04
           - arch: aarch64
-            platform: linux/arm64
-            build_from: ghcr.io/home-assistant/aarch64-base:3.21
-          - arch: armv7
-            platform: linux/arm/v7
-            build_from: ghcr.io/home-assistant/armv7-base:3.21
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-      - name: Test build ${{ matrix.arch }} addon image
-        uses: docker/build-push-action@v7
         with:
+          persist-credentials: false
+      - name: Build ${{ matrix.arch }} app image
+        uses: home-assistant/builder/actions/build-image@2026.09.0
+        with:
+          arch: ${{ matrix.arch }}
           context: .
           file: addon/Dockerfile
-          platforms: ${{ matrix.platform }}
+          image: ghcr.io/${{ github.repository_owner }}/pview-addon-${{ matrix.arch }}
+          image-tags: pr-${{ github.event.number }}
+          version: pr-${{ github.event.number }}
           push: false
-          build-args: |
-            BUILD_FROM=${{ matrix.build_from }}
+          cosign: false
