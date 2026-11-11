@@ -24,13 +24,18 @@ RUN rustup target add "$(cat /rust_target.txt)"
 WORKDIR /work
 COPY . .
 
+# .cargo/config.toml links aarch64/armv7 with bare lld for cross builds. On a
+# native builder cargo applies that to host proc-macros too, and bare lld cannot
+# find -lc or -lgcc_s, so link with cc when building for the build machine.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/work/target \
-    CC=clang cargo build --locked --release \
-        --target "$(cat /rust_target.txt)" \
-        --bin pview && \
-    cp "target/$(cat /rust_target.txt)/release/pview" /pview
+    target="$(cat /rust_target.txt)" && \
+    if [ "$(rustc -vV | sed -n 's/^host: //p')" = "$target" ]; then \
+        export "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=cc"; \
+    fi && \
+    CC=clang cargo build --locked --release --target "$target" --bin pview && \
+    cp "target/$target/release/pview" /pview
 
 ####################################################################################################
 ## Runtime image
